@@ -1,0 +1,53 @@
+//! Attesta backend API.
+//!
+//! Serves Merkle paths to provers, relays encrypted note blobs, accepts
+//! issuer credential deliveries (ciphertext only), and exposes public
+//! protocol stats and prover artifacts.
+//!
+//! Hard invariant: no endpoint accepts a plaintext amount, a spending key,
+//! or an unencrypted credential. Ciphertext in, ciphertext out.
+
+mod error;
+mod routes;
+mod state;
+
+use std::sync::Arc;
+
+use attesta_core::{config::Config, db};
+use tokio::sync::broadcast;
+use tower_http::{limit::RequestBodyLimitLayer, trace::TraceLayer};
+use tracing_subscriber::EnvFilter;
+
+use crate::state::AppState;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    dotenvy::dotenv().ok();
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
+        .init();
+
+    let config = Config::from_env()?;
+    let pool = db::connect(&config.database_url).await?;
+    db::migrate(&pool).await?;
+
+    // Note fan-out channel: a lightweight poller watches the encrypted_notes
+    // table and broadcasts new rows to SSE subscribers.
+    let (note_tx, _) = broadcast::channel(1024);
+    let state = Arc::new(AppState {
+        db: pool,
+        config: config.clone(),
+        note_tx,
+    });
+
+    tokio::spawn(routes::notes::poll_new_notes(state.clone()));
+
+    let app = routes::router(state)
+        .layer(RequestBodyLimitLayer::new(256 * 1024)) // ciphertext blobs are small
+        .layer(TraceLayer::new_for_http());
+
+    let listener = tokio::net::TcpListener::bind(&config.bind_addr).await?;
+    tracing::info!(addr = %config.bind_addr, "attesta-api listening");
+    axum::serve(listener, app).await?;
+    Ok(())
+}

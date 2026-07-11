@@ -1,0 +1,17 @@
+[package]
+name = "attesta-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+hex.workspace = true
+sha2.workspace = true
+tracing.workspace = true

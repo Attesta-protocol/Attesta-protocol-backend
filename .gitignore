@@ -1,0 +1,12 @@
+/target
+**/*.rs.bk
+.env
+*.log
+
+# Local prover artifacts (published via CDN, never committed)
+/artifacts/**/*.wasm
+/artifacts/**/*.zkey
+
+# Editor
+.idea/
+.vscode/

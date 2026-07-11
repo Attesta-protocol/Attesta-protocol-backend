@@ -1,0 +1,51 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: attesta
+      POSTGRES_PASSWORD: attesta
+      POSTGRES_DB: attesta
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U attesta"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build: .
+    command: ["api"]
+    environment:
+      DATABASE_URL: postgres://attesta:attesta@db:5432/attesta
+      BIND_ADDR: 0.0.0.0:8080
+      SOROBAN_RPC_URL: ${SOROBAN_RPC_URL:-https://soroban-testnet.stellar.org}
+      ARTIFACTS_DIR: /artifacts
+      RUST_LOG: info
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./artifacts:/artifacts:ro
+    depends_on:
+      db:
+        condition: service_healthy
+    profiles: ["full"]
+
+  indexer:
+    build: .
+    command: ["indexer"]
+    environment:
+      DATABASE_URL: postgres://attesta:attesta@db:5432/attesta
+      SOROBAN_RPC_URL: ${SOROBAN_RPC_URL:-https://soroban-testnet.stellar.org}
+      POOL_CONTRACT_IDS: ${POOL_CONTRACT_IDS:-}
+      REGISTRY_CONTRACT_ID: ${REGISTRY_CONTRACT_ID:-}
+      RUST_LOG: info
+    depends_on:
+      db:
+        condition: service_healthy
+    profiles: ["full"]
+
+volumes:
+  pgdata:
