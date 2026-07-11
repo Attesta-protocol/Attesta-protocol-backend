@@ -5,6 +5,11 @@
 //! a Poseidon instance over the BLS12-381 scalar field, matching the
 //! on-chain verifier introduced with Protocol 25. Swapping the hasher is a
 //! `security-critical` change requiring dual review (see CONTRIBUTING).
+//!
+//! The tree caches every internal level, so `append` costs O(depth),
+//! `root` is O(1), and `path` is O(depth). Memory is ~2n nodes for n
+//! leaves. Callers keep one long-lived tree per pool and top it up with
+//! newly indexed leaves instead of rebuilding from the database.
 
 use sha2::{Digest, Sha256};
 
@@ -43,12 +48,14 @@ pub struct PathElement {
     pub sibling_on_right: bool,
 }
 
-/// In-memory incremental Merkle tree, rebuilt from the `commitments` table
-/// (ordered by `leaf_index`). Fine for testnet scale; a cached-frontier
-/// implementation replaces this before mainnet.
+/// Incremental Merkle tree with cached levels.
+///
+/// `levels[0]` holds the leaves; `levels[d]` holds the populated nodes at
+/// depth `d`. Nodes to the right of the populated region are roots of empty
+/// subtrees (`zeros[d]`) and are never materialized.
 pub struct MerkleTree<H: TreeHasher = Sha256Hasher> {
     hasher: H,
-    leaves: Vec<Node>,
+    levels: Vec<Vec<Node>>,
     /// zeros[d] = root of an empty subtree of depth d.
     zeros: Vec<Node>,
 }
@@ -63,78 +70,76 @@ impl<H: TreeHasher> MerkleTree<H> {
         }
         Self {
             hasher,
-            leaves: Vec::new(),
+            levels: vec![Vec::new(); TREE_DEPTH + 1],
             zeros,
         }
     }
 
     pub fn from_leaves(hasher: H, leaves: Vec<Node>) -> Self {
         let mut tree = Self::new(hasher);
-        tree.leaves = leaves;
+        for leaf in leaves {
+            tree.append(leaf);
+        }
         tree
     }
 
+    /// Append a leaf and update the cached ancestors up to the root.
     pub fn append(&mut self, leaf: Node) -> usize {
-        self.leaves.push(leaf);
-        self.leaves.len() - 1
+        let index = self.levels[0].len();
+        self.levels[0].push(leaf);
+
+        let mut idx = index;
+        for depth in 0..TREE_DEPTH {
+            let parent_idx = idx / 2;
+            let left = self.levels[depth][2 * parent_idx];
+            let right = self.levels[depth]
+                .get(2 * parent_idx + 1)
+                .copied()
+                .unwrap_or(self.zeros[depth]);
+            let parent = self.hasher.hash_pair(&left, &right);
+
+            let parents = &mut self.levels[depth + 1];
+            if parent_idx == parents.len() {
+                parents.push(parent);
+            } else {
+                parents[parent_idx] = parent;
+            }
+            idx = parent_idx;
+        }
+        index
     }
 
     pub fn len(&self) -> usize {
-        self.leaves.len()
+        self.levels[0].len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.leaves.is_empty()
+        self.levels[0].is_empty()
     }
 
     pub fn root(&self) -> Node {
-        let mut level: Vec<Node> = self.leaves.clone();
-        for depth in 0..TREE_DEPTH {
-            if level.is_empty() {
-                return self.zeros[TREE_DEPTH];
-            }
-            let mut next = Vec::with_capacity(level.len().div_ceil(2));
-            for pair in level.chunks(2) {
-                let left = pair[0];
-                let right = if pair.len() == 2 {
-                    pair[1]
-                } else {
-                    self.zeros[depth]
-                };
-                next.push(self.hasher.hash_pair(&left, &right));
-            }
-            level = next;
-        }
-        level[0]
+        self.levels[TREE_DEPTH]
+            .first()
+            .copied()
+            .unwrap_or(self.zeros[TREE_DEPTH])
     }
 
     /// Merkle path (bottom-up siblings) for the leaf at `index`.
     pub fn path(&self, index: usize) -> Option<Vec<PathElement>> {
-        if index >= self.leaves.len() {
+        if index >= self.levels[0].len() {
             return None;
         }
         let mut path = Vec::with_capacity(TREE_DEPTH);
-        let mut level: Vec<Node> = self.leaves.clone();
         let mut idx = index;
         for depth in 0..TREE_DEPTH {
-            let sibling_idx = idx ^ 1;
-            let sibling = level.get(sibling_idx).copied().unwrap_or(self.zeros[depth]);
+            let sibling = self.levels[depth]
+                .get(idx ^ 1)
+                .copied()
+                .unwrap_or(self.zeros[depth]);
             path.push(PathElement {
                 sibling,
                 sibling_on_right: idx.is_multiple_of(2),
             });
-
-            let mut next = Vec::with_capacity(level.len().div_ceil(2));
-            for pair in level.chunks(2) {
-                let left = pair[0];
-                let right = if pair.len() == 2 {
-                    pair[1]
-                } else {
-                    self.zeros[depth]
-                };
-                next.push(self.hasher.hash_pair(&left, &right));
-            }
-            level = next;
             idx /= 2;
         }
         Some(path)
@@ -165,10 +170,49 @@ mod tests {
         l
     }
 
+    /// Reference root: naive full rebuild, level by level.
+    fn naive_root(leaves: &[Node]) -> Node {
+        let hasher = Sha256Hasher;
+        let mut zeros = vec![hasher.empty_leaf()];
+        for d in 0..TREE_DEPTH {
+            let z = zeros[d];
+            zeros.push(hasher.hash_pair(&z, &z));
+        }
+        let mut level = leaves.to_vec();
+        for depth in 0..TREE_DEPTH {
+            if level.is_empty() {
+                return zeros[TREE_DEPTH];
+            }
+            let mut next = Vec::with_capacity(level.len().div_ceil(2));
+            for pair in level.chunks(2) {
+                let left = pair[0];
+                let right = if pair.len() == 2 {
+                    pair[1]
+                } else {
+                    zeros[depth]
+                };
+                next.push(hasher.hash_pair(&left, &right));
+            }
+            level = next;
+        }
+        level[0]
+    }
+
     #[test]
     fn empty_tree_has_stable_root() {
         let t = MerkleTree::new(Sha256Hasher);
         assert_eq!(t.root(), t.zeros[TREE_DEPTH]);
+    }
+
+    #[test]
+    fn incremental_root_matches_naive_rebuild() {
+        let mut t = MerkleTree::new(Sha256Hasher);
+        let mut leaves = Vec::new();
+        for n in 1..=9u8 {
+            leaves.push(leaf(n));
+            t.append(leaf(n));
+            assert_eq!(t.root(), naive_root(&leaves), "diverged at {n} leaves");
+        }
     }
 
     #[test]
@@ -189,6 +233,21 @@ mod tests {
     }
 
     #[test]
+    fn old_paths_still_verify_after_later_appends() {
+        let mut t = MerkleTree::new(Sha256Hasher);
+        for n in 1..=3u8 {
+            t.append(leaf(n));
+        }
+        t.append(leaf(4));
+        let root = t.root();
+        // Paths must be re-fetched against the new root and still verify.
+        for i in 0..4 {
+            let path = t.path(i).expect("path exists");
+            assert!(t.verify_path(leaf(i as u8 + 1), &path, root));
+        }
+    }
+
+    #[test]
     fn path_for_missing_leaf_is_none() {
         let t = MerkleTree::new(Sha256Hasher);
         assert!(t.path(0).is_none());
@@ -201,5 +260,17 @@ mod tests {
         let r1 = t.root();
         t.append(leaf(2));
         assert_ne!(r1, t.root());
+    }
+
+    #[test]
+    fn from_leaves_matches_appends() {
+        let leaves: Vec<Node> = (1..=6u8).map(leaf).collect();
+        let t1 = MerkleTree::from_leaves(Sha256Hasher, leaves.clone());
+        let mut t2 = MerkleTree::new(Sha256Hasher);
+        for l in leaves {
+            t2.append(l);
+        }
+        assert_eq!(t1.root(), t2.root());
+        assert_eq!(t1.len(), t2.len());
     }
 }

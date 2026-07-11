@@ -38,6 +38,7 @@ async fn main() -> anyhow::Result<()> {
         db: pool,
         config: config.clone(),
         note_tx,
+        trees: Default::default(),
     });
 
     tokio::spawn(routes::notes::poll_new_notes(state.clone()));

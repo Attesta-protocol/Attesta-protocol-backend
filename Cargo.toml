@@ -44,6 +44,7 @@ sha2 = "0.10"
 futures = "0.3"
 tokio-stream = { version = "0.1", features = ["sync"] }
 dotenvy = "0.15"
+stellar-xdr = { version = "27", features = ["base64"] }
 
 [profile.release]
 lto = "thin"

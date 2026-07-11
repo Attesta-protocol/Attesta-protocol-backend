@@ -86,6 +86,9 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
 
+For end-to-end verification (driving the indexer against a mock Soroban RPC
+and exercising the tree endpoints), see `.claude/skills/verify/SKILL.md`.
+
 ### Disclosure CLI
 
 ```bash
@@ -113,22 +116,31 @@ cargo run --bin disclosure -- verify report.json
 - **Integrity-checkable artifacts.** Proving keys and WASM provers are served
   with a manifest of SHA-256 hashes and an `x-artifact-sha256` response
   header, so clients verify before proving.
+- **Cheap, honest tree serving.** The API keeps one incremental Merkle tree
+  per pool in memory (O(depth) appends, O(1) root) and tops it up from the
+  `commitments` table per request. If the indexer leaves a gap in leaf
+  indexes, the tree stops before the gap rather than serving misplaced
+  leaves — a wrong path would make client proofs silently unverifiable.
 
 ## Status / TODO toward M2 (shielded pool MVP)
 
 - [x] Workspace, schema, migrations, docker compose, container image
 - [x] Tree endpoints, note relay + SSE, issuer gateway, stats, artifacts CDN
 - [x] Indexer loop with cursor persistence and idempotent, replayable ingest
-- [ ] Real XDR (`ScVal`) event decoding once the pool contract's event layout
-      freezes (`crates/attesta-indexer/src/events.rs` — currently a JSON shim
-      so the ingest path is testable today)
+- [x] Real XDR (`ScVal`) event decoding via `stellar-xdr`
+      (`crates/attesta-indexer/src/events.rs` — decodes a provisional
+      symbol-keyed map layout documented in the module; re-check the field
+      tables once the pool contract's event layout freezes. The JSON shim
+      remains as a test-only fallback)
+- [x] Incremental Merkle tree with cached levels — O(depth) appends, O(1)
+      root, O(depth) paths — plus a per-pool in-memory tree cache in the API
+      that tops up from the `commitments` table instead of rebuilding per
+      request
 - [ ] Poseidon-over-BLS12-381 tree hasher matching the circuits
       (`crates/attesta-core/src/merkle.rs` — currently a SHA-256 placeholder
       behind the `TreeHasher` trait; **security-critical**, dual review)
 - [ ] Issuer signature verification on credential delivery (blocked on the
       M5 credential envelope format)
-- [ ] Cached-frontier Merkle tree (current implementation rebuilds from
-      leaves per request; fine for testnet scale)
 - [ ] Disclosure trial-decryption + per-entry Merkle path verification
       (blocked on the M3 note encryption format)
 

@@ -1,15 +1,22 @@
 //! Merkle tree endpoints: paths for provers, current root + block anchor.
+//!
+//! Trees are cached in memory per pool (see [`PoolTree`]) and topped up
+//! with newly indexed leaves on each request, so serving a path costs one
+//! small DB query plus O(depth) work instead of a full tree rebuild.
 
 use std::sync::Arc;
 
-use attesta_core::merkle::{MerkleTree, Node, Sha256Hasher};
+use attesta_core::merkle::Node;
 use axum::{
     extract::{Path, Query, State},
     Json,
 };
 use serde::{Deserialize, Serialize};
 
-use crate::{error::ApiError, state::AppState};
+use crate::{
+    error::ApiError,
+    state::{AppState, PoolTree},
+};
 
 #[derive(Deserialize)]
 pub struct PathQuery {
@@ -50,22 +57,23 @@ pub async fn get_path(
 ) -> Result<Json<PathResponse>, ApiError> {
     let commitment = parse_node(&q.commitment)?;
 
-    let (leaves, anchored_ledger) = load_leaves(&state, &pool).await?;
-    let leaf_index = leaves
-        .iter()
-        .position(|l| *l == commitment)
-        .ok_or_else(|| ApiError::not_found("commitment not found in tree"))?;
+    let mut trees = state.trees.lock().await;
+    let pool_tree = sync_pool_tree(&state, &mut trees, &pool).await?;
 
-    let tree = MerkleTree::from_leaves(Sha256Hasher, leaves);
-    let path = tree
+    let leaf_index = *pool_tree
+        .index_by_commitment
+        .get(&commitment)
+        .ok_or_else(|| ApiError::not_found("commitment not found in tree"))?;
+    let path = pool_tree
+        .tree
         .path(leaf_index)
         .ok_or_else(|| ApiError::not_found("commitment not found in tree"))?;
 
     Ok(Json(PathResponse {
         pool,
         leaf_index: leaf_index as i64,
-        root: hex0x(&tree.root()),
-        anchored_ledger,
+        root: hex0x(&pool_tree.tree.root()),
+        anchored_ledger: pool_tree.anchored_ledger,
         path: path
             .into_iter()
             .map(|el| PathElementJson {
@@ -81,47 +89,61 @@ pub async fn get_root(
     State(state): State<Arc<AppState>>,
     Path(pool): Path<String>,
 ) -> Result<Json<RootResponse>, ApiError> {
-    let (leaves, anchored_ledger) = load_leaves(&state, &pool).await?;
-    let leaf_count = leaves.len() as i64;
-    let tree = MerkleTree::from_leaves(Sha256Hasher, leaves);
+    let mut trees = state.trees.lock().await;
+    let pool_tree = sync_pool_tree(&state, &mut trees, &pool).await?;
     Ok(Json(RootResponse {
         pool,
-        root: hex0x(&tree.root()),
-        leaf_count,
-        anchored_ledger,
+        root: hex0x(&pool_tree.tree.root()),
+        leaf_count: pool_tree.tree.len() as i64,
+        anchored_ledger: pool_tree.anchored_ledger,
     }))
 }
 
-/// Load all leaves for a pool, ordered by leaf_index, plus the newest ledger.
-/// Testnet-scale implementation; replaced by a cached frontier later.
-async fn load_leaves(state: &AppState, pool: &str) -> Result<(Vec<Node>, i64), ApiError> {
-    let rows: Vec<(Vec<u8>, i64)> = sqlx::query_as(
-        "SELECT commitment, ledger FROM commitments WHERE pool = $1 ORDER BY leaf_index",
+/// Top up the cached tree for `pool` with leaves indexed since the last
+/// request, and return it. 404s for a pool with no leaves at all.
+async fn sync_pool_tree<'a>(
+    state: &AppState,
+    trees: &'a mut std::collections::HashMap<String, PoolTree>,
+    pool: &str,
+) -> Result<&'a PoolTree, ApiError> {
+    let pool_tree = trees.entry(pool.to_string()).or_default();
+
+    let rows: Vec<(i64, Vec<u8>, i64)> = sqlx::query_as(
+        "SELECT leaf_index, commitment, ledger FROM commitments
+         WHERE pool = $1 AND leaf_index >= $2 ORDER BY leaf_index",
     )
     .bind(pool)
+    .bind(pool_tree.tree.len() as i64)
     .fetch_all(&state.db)
     .await?;
 
-    if rows.is_empty() {
+    for (leaf_index, bytes, ledger) in rows {
+        // Leaves must arrive contiguously; a gap means the indexer is
+        // mid-backfill (or missed events). Serve what we have up to it —
+        // appending past a gap would put every later leaf at the wrong index.
+        if leaf_index != pool_tree.tree.len() as i64 {
+            tracing::warn!(
+                pool,
+                expected = pool_tree.tree.len(),
+                got = leaf_index,
+                "gap in commitment leaf indexes; serving tree up to the gap"
+            );
+            break;
+        }
+        let node: Node = bytes
+            .try_into()
+            .map_err(|_| ApiError::bad_request("corrupt commitment in index"))?;
+        let idx = pool_tree.tree.append(node);
+        pool_tree.index_by_commitment.insert(node, idx);
+        pool_tree.anchored_ledger = pool_tree.anchored_ledger.max(ledger);
+    }
+
+    if pool_tree.tree.is_empty() {
         return Err(ApiError::not_found(format!(
             "unknown or empty pool: {pool}"
         )));
     }
-
-    let anchored_ledger = rows.iter().map(|(_, l)| *l).max().unwrap_or(0);
-    let leaves = rows
-        .into_iter()
-        .map(|(bytes, _)| {
-            let mut node: Node = [0u8; 32];
-            if bytes.len() != 32 {
-                return Err(ApiError::bad_request("corrupt commitment in index"));
-            }
-            node.copy_from_slice(&bytes);
-            Ok(node)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-
-    Ok((leaves, anchored_ledger))
+    Ok(pool_tree)
 }
 
 fn parse_node(s: &str) -> Result<Node, ApiError> {
