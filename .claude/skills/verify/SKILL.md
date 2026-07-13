@@ -46,13 +46,29 @@ the sync loop re-fetches forever. Idempotent inserts make replays harmless.
 
 ## Flows worth driving
 
-- `GET /health`, `GET /v1/tree/{pool}/root`, `GET /v1/tree/{pool}/path?commitment=0x…`
+- `GET /health/live` + `/health/ready` (stop the db container → ready
+  flips to 503 `{"failing":"database"}` and recovers without a restart),
+  `GET /v1/tree/{pool}/root`, `GET /v1/tree/{pool}/path?commitment=0x…`
 - Recompute the served Merkle path externally (sha256 over
   `left||right`, `sibling_on_right` chooses order) — must equal `root`.
+- Historical roots: after seeding leaves at distinct ledgers,
+  `/root?at_ledger=L` and `/root?at_leaf_count=N` must return the
+  matching `tree_roots` row; both params together → 400.
 - Tree cache top-up: INSERT a commitment row mid-session, re-hit `/root`,
-  leaf_count must grow without an API restart.
+  leaf_count must grow without an API restart (and `tree_roots` gains a
+  row per new leaf).
 - Gap guard: INSERT a leaf with a skipped `leaf_index` — tree must stop
   before the gap and log "gap in commitment leaf indexes".
+- Claim lifecycle: deliver with `claim_token_hash` (sha256 of the token,
+  b64) → pickup shows it → claim with wrong token 403, right token 204,
+  again 409 → pickup no longer returns it.
+- SSE resume: seed notes, connect with `Last-Event-ID: N` → replays
+  `id > N` in order, then a fresh INSERT arrives live via LISTEN/NOTIFY
+  (log line "note fan-out in push mode").
+- Rate limits: >RATE_LIMIT_WRITE_BURST rapid POSTs → 429 with
+  `Retry-After`, while reads keep returning 200.
+- `GET /metrics`: `attesta_api_requests_total` labeled by route pattern
+  (never raw URLs), tree/SSE gauges present.
 - Indexer decode: check `commitments`, `nullifiers`, `encrypted_notes`,
   `pool_totals`, `issuers`, `indexer_cursors` tables after a sync pass.
 
@@ -60,6 +76,6 @@ the sync loop re-fetches forever. Idempotent inserts make replays harmless.
 
 ```bash
 docker compose exec -T db psql -U attesta -d attesta -c \
-  "TRUNCATE commitments, nullifiers, encrypted_notes, pool_totals, issuers, indexer_cursors CASCADE;"
+  "TRUNCATE commitments, nullifiers, encrypted_notes, pool_totals, issuers, indexer_cursors, credential_deliveries, tree_roots CASCADE;"
 docker compose stop db
 ```
