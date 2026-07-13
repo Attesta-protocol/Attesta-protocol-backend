@@ -262,6 +262,44 @@ mod tests {
         assert_ne!(r1, t.root());
     }
 
+    /// Root history (Issue 5) invariant: the root after leaf n is a pure
+    /// function of the first n leaves, so replaying appends after a
+    /// database drop reproduces the identical tree_roots history.
+    #[test]
+    fn per_append_root_history_is_replayable() {
+        // Pseudo-random but deterministic leaf sequence.
+        let leaves: Vec<Node> = (0..17u64)
+            .map(|n| {
+                let mut h = Sha256::new();
+                h.update(n.to_be_bytes());
+                h.finalize().into()
+            })
+            .collect();
+
+        let record_history = |leaves: &[Node]| -> Vec<Node> {
+            let mut t = MerkleTree::new(Sha256Hasher);
+            leaves
+                .iter()
+                .map(|l| {
+                    t.append(*l);
+                    t.root()
+                })
+                .collect()
+        };
+
+        let first = record_history(&leaves);
+        let replayed = record_history(&leaves);
+        assert_eq!(first, replayed);
+        // Every append must change the root (no silent no-op appends).
+        for w in first.windows(2) {
+            assert_ne!(w[0], w[1]);
+        }
+        // And each history entry matches a naive rebuild at that size.
+        for (n, root) in first.iter().enumerate() {
+            assert_eq!(*root, naive_root(&leaves[..=n]), "diverged at {n}");
+        }
+    }
+
     #[test]
     fn from_leaves_matches_appends() {
         let leaves: Vec<Node> = (1..=6u8).map(leaf).collect();
