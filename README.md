@@ -283,9 +283,14 @@ is ciphertext a recipient re-fetches at leisure.
 ```
 GET  /health                               → liveness
 GET  /v1/tree/{pool}/path?commitment=0x…   → Merkle path for proving
-       { pool, leaf_index, root, anchored_ledger,
+       { pool, leaf_index, root, leaf_count, anchored_ledger,
          path: [{ sibling, sibling_on_right }] × 32 }
 GET  /v1/tree/{pool}/root                  → { pool, root, leaf_count, anchored_ledger }
+       ?at_ledger=L      → newest root anchored at or before ledger L
+       ?at_leaf_count=N  → root the tree had at leaf count ≤ N
+       (historical answers come from the tree_roots table — an index
+        lookup, never a rebuild; history replays identically after a
+        database drop)
 GET  /v1/notes?since_cursor=&pool=         → { notes: […], next_cursor } (500/page)
 GET  /v1/notes/stream                      → SSE, event: note, 20 s keep-alive
 POST /v1/issuer/credentials                → { issuer_id, recipient_hint,
