@@ -84,18 +84,80 @@ pub async fn get_path(
     }))
 }
 
-/// GET /v1/tree/{pool}/root
+#[derive(Deserialize)]
+pub struct RootQuery {
+    /// Return the newest root anchored at or before this ledger.
+    pub at_ledger: Option<i64>,
+    /// Return the root the tree had at exactly this leaf count (or the
+    /// newest earlier one if that count fell inside a multi-leaf batch).
+    pub at_leaf_count: Option<i64>,
+}
+
+/// GET /v1/tree/{pool}/root?at_ledger=&at_leaf_count=
+///
+/// Without params, serves the current root from the in-memory tree. With
+/// `at_ledger` or `at_leaf_count`, answers from the `tree_roots` history —
+/// an index lookup, never a tree rebuild. Provers use this to check their
+/// proof's anchor is still inside the contract's accepted-root window;
+/// disclosure `verify` uses it to re-check old reports (Issues 4/5).
 pub async fn get_root(
     State(state): State<Arc<AppState>>,
     Path(pool): Path<String>,
+    Query(q): Query<RootQuery>,
 ) -> Result<Json<RootResponse>, ApiError> {
-    let mut trees = state.trees.lock().await;
-    let pool_tree = sync_pool_tree(&state, &mut trees, &pool).await?;
+    if q.at_ledger.is_some() && q.at_leaf_count.is_some() {
+        return Err(ApiError::bad_request(
+            "at_ledger and at_leaf_count are mutually exclusive",
+        ));
+    }
+
+    // Top up (and thus persist history for) the tree first, so historical
+    // answers cover everything indexed up to this moment.
+    {
+        let mut trees = state.trees.lock().await;
+        let pool_tree = sync_pool_tree(&state, &mut trees, &pool).await?;
+        if q.at_ledger.is_none() && q.at_leaf_count.is_none() {
+            return Ok(Json(RootResponse {
+                pool,
+                root: hex0x(&pool_tree.tree.root()),
+                leaf_count: pool_tree.tree.len() as i64,
+                anchored_ledger: pool_tree.anchored_ledger,
+            }));
+        }
+    } // drop the tree lock before the history lookup
+
+    let row: Option<(Vec<u8>, i64, i64)> = if let Some(at_ledger) = q.at_ledger {
+        sqlx::query_as(
+            "SELECT root, leaf_count, ledger FROM tree_roots
+             WHERE pool = $1 AND ledger <= $2
+             ORDER BY leaf_count DESC LIMIT 1",
+        )
+        .bind(&pool)
+        .bind(at_ledger)
+        .fetch_optional(&state.db)
+        .await?
+    } else {
+        sqlx::query_as(
+            "SELECT root, leaf_count, ledger FROM tree_roots
+             WHERE pool = $1 AND leaf_count <= $2
+             ORDER BY leaf_count DESC LIMIT 1",
+        )
+        .bind(&pool)
+        .bind(q.at_leaf_count.unwrap_or(0))
+        .fetch_optional(&state.db)
+        .await?
+    };
+
+    let (root, leaf_count, ledger) =
+        row.ok_or_else(|| ApiError::not_found("no root recorded at or before that point"))?;
+    let root: Node = root
+        .try_into()
+        .map_err(|_| ApiError::bad_request("corrupt root in history"))?;
     Ok(Json(RootResponse {
         pool,
-        root: hex0x(&pool_tree.tree.root()),
-        leaf_count: pool_tree.tree.len() as i64,
-        anchored_ledger: pool_tree.anchored_ledger,
+        root: hex0x(&root),
+        leaf_count,
+        anchored_ledger: ledger,
     }))
 }
 
