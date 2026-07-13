@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use attesta_core::{
     config::Config,
@@ -8,11 +8,19 @@ use attesta_core::{
 use sqlx::PgPool;
 use tokio::sync::{broadcast, Mutex};
 
+use crate::limits::{IpBuckets, SseSlots};
+
 pub struct AppState {
     pub db: PgPool,
     pub config: Config,
     /// New encrypted notes are broadcast here for SSE subscribers.
     pub note_tx: broadcast::Sender<EncryptedNoteRow>,
+    /// Per-IP budgets for read endpoints.
+    pub read_buckets: IpBuckets,
+    /// Per-IP budgets for write endpoints.
+    pub write_buckets: IpBuckets,
+    /// Concurrent SSE connection accounting.
+    pub sse_slots: Arc<SseSlots>,
     /// Cached commitment trees, one per pool, topped up incrementally from
     /// the `commitments` table on each tree request. One lock for the whole
     /// map is fine at current scale; requests only hold it for the top-up

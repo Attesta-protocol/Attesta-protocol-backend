@@ -8,6 +8,7 @@
 //! or an unencrypted credential. Ciphertext in, ciphertext out.
 
 mod error;
+mod limits;
 mod retention;
 mod routes;
 mod state;
@@ -35,10 +36,14 @@ async fn main() -> anyhow::Result<()> {
     // Note fan-out channel: a lightweight poller watches the encrypted_notes
     // table and broadcasts new rows to SSE subscribers.
     let (note_tx, _) = broadcast::channel(1024);
+    let rl = &config.rate_limits;
     let state = Arc::new(AppState {
         db: pool,
         config: config.clone(),
         note_tx,
+        read_buckets: limits::IpBuckets::new(rl.read_per_sec, rl.read_burst),
+        write_buckets: limits::IpBuckets::new(rl.write_per_sec, rl.write_burst),
+        sse_slots: Arc::new(limits::SseSlots::new(rl.sse_per_ip, rl.sse_global)),
         trees: Default::default(),
     });
 
@@ -51,6 +56,11 @@ async fn main() -> anyhow::Result<()> {
 
     let listener = tokio::net::TcpListener::bind(&config.bind_addr).await?;
     tracing::info!(addr = %config.bind_addr, "attesta-api listening");
-    axum::serve(listener, app).await?;
+    // ConnectInfo gives the rate limiter each client's peer address.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
