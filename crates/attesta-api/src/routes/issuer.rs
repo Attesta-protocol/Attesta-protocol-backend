@@ -31,6 +31,10 @@ pub struct DeliverCredentialRequest {
     pub ciphertext: String,
     /// Base64 issuer signature over the ciphertext.
     pub issuer_signature: String,
+    /// Base64 SHA-256 of a claim token carried inside the encrypted
+    /// payload. Optional; without it the delivery can never be claimed
+    /// and only ages out via retention (docs/credential-mailbox.md).
+    pub claim_token_hash: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -55,6 +59,19 @@ pub async fn deliver_credential(
     if req.recipient_hint.is_empty() || req.recipient_hint.len() > 128 {
         return Err(ApiError::bad_request("recipient_hint size out of bounds"));
     }
+    let claim_token_hash = req
+        .claim_token_hash
+        .as_deref()
+        .map(|s| {
+            let hash = B64
+                .decode(s)
+                .map_err(|_| ApiError::bad_request("claim_token_hash must be base64"))?;
+            if hash.len() != 32 {
+                return Err(ApiError::bad_request("claim_token_hash must be 32 bytes"));
+            }
+            Ok(hash)
+        })
+        .transpose()?;
 
     let issuer: Option<IssuerRow> = sqlx::query_as(
         "SELECT issuer_id, name, public_key, claim_types, status, registered_ledger
@@ -73,14 +90,16 @@ pub async fn deliver_credential(
     let delivery_id = Uuid::new_v4();
     sqlx::query(
         "INSERT INTO credential_deliveries
-             (delivery_id, issuer_id, recipient_hint, ciphertext, issuer_signature)
-         VALUES ($1, $2, $3, $4, $5)",
+             (delivery_id, issuer_id, recipient_hint, ciphertext, issuer_signature,
+              claim_token_hash)
+         VALUES ($1, $2, $3, $4, $5, $6)",
     )
     .bind(delivery_id)
     .bind(&req.issuer_id)
     .bind(&req.recipient_hint)
     .bind(&ciphertext)
     .bind(&signature)
+    .bind(&claim_token_hash)
     .execute(&state.db)
     .await?;
 
