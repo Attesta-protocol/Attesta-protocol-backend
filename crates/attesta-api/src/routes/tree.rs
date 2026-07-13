@@ -61,7 +61,7 @@ pub async fn get_path(
 ) -> Result<Json<PathResponse>, ApiError> {
     let commitment = parse_node(&q.commitment)?;
 
-    let mut trees = state.trees.lock().await;
+    let mut trees = lock_trees(&state).await;
     let pool_tree = sync_pool_tree(&state, &mut trees, &pool).await?;
 
     let leaf_index = *pool_tree
@@ -119,7 +119,7 @@ pub async fn get_root(
     // Top up (and thus persist history for) the tree first, so historical
     // answers cover everything indexed up to this moment.
     {
-        let mut trees = state.trees.lock().await;
+        let mut trees = lock_trees(&state).await;
         let pool_tree = sync_pool_tree(&state, &mut trees, &pool).await?;
         if q.at_ledger.is_none() && q.at_leaf_count.is_none() {
             return Ok(Json(RootResponse {
@@ -166,6 +166,18 @@ pub async fn get_root(
     }))
 }
 
+/// Take the shared tree lock, recording how long the wait took (the lock
+/// is the tree endpoints' main contention point — worth watching).
+async fn lock_trees(
+    state: &AppState,
+) -> tokio::sync::MutexGuard<'_, std::collections::HashMap<String, PoolTree>> {
+    let started = std::time::Instant::now();
+    let guard = state.trees.lock().await;
+    metrics::histogram!("attesta_api_tree_lock_wait_seconds")
+        .record(started.elapsed().as_secs_f64());
+    guard
+}
+
 /// Top up the cached tree for `pool` with leaves indexed since the last
 /// request, and return it. 404s for a pool with no leaves at all.
 async fn sync_pool_tree<'a>(
@@ -173,6 +185,7 @@ async fn sync_pool_tree<'a>(
     trees: &'a mut std::collections::HashMap<String, PoolTree>,
     pool: &str,
 ) -> Result<&'a PoolTree, ApiError> {
+    let topup_started = std::time::Instant::now();
     let pool_tree = trees.entry(pool.to_string()).or_default();
 
     let rows: Vec<(i64, Vec<u8>, i64)> = sqlx::query_as(
@@ -232,6 +245,11 @@ async fn sync_pool_tree<'a>(
         .execute(&state.db)
         .await?;
     }
+
+    metrics::histogram!("attesta_api_tree_topup_duration_seconds")
+        .record(topup_started.elapsed().as_secs_f64());
+    metrics::gauge!("attesta_api_tree_leaves", "pool" => pool.to_string())
+        .set(pool_tree.tree.len() as f64);
 
     if pool_tree.tree.is_empty() {
         return Err(ApiError::not_found(format!(

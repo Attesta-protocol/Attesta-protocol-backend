@@ -125,6 +125,7 @@ impl SseSlots {
             *count += 1;
         }
         self.global.fetch_add(1, Ordering::Relaxed);
+        metrics::gauge!("attesta_api_sse_subscribers").set(self.active() as f64);
         Some(SseSlot {
             slots: Arc::clone(self),
             ip,
@@ -145,6 +146,7 @@ pub struct SseSlot {
 impl Drop for SseSlot {
     fn drop(&mut self) {
         self.slots.global.fetch_sub(1, Ordering::Relaxed);
+        metrics::gauge!("attesta_api_sse_subscribers").set(self.slots.active() as f64);
         let mut per_ip = self.slots.per_ip.lock().expect("sse lock poisoned");
         if let Some(count) = per_ip.get_mut(&self.ip) {
             *count -= 1;
