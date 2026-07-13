@@ -311,7 +311,15 @@ GET  /v1/artifacts/{circuit}/{version}/{f} → artifact bytes + x-artifact-sha25
 
 Errors are JSON with appropriate status codes: 400 for malformed input
 (bad hex, wrong lengths, oversized bodies), 404 for unknown
-pools/commitments/artifacts.
+pools/commitments/artifacts, 403/409 for claim failures, and 429 (with
+`Retry-After`) when a rate limit or quota trips.
+
+Abuse protection ships on by default (per-IP token buckets with separate
+read/write budgets, SSE connection caps, a per-issuer hourly delivery
+quota, and an optional CORS allowlist for browser provers). Every limit
+is a `RATE_LIMIT_*` / `CORS_ALLOWED_ORIGINS` env knob and `0` disables
+it — see `.env.example`. Limits key on the socket peer address, so when
+running behind a reverse proxy, enforce limits there as well.
 
 ## Development setup
 
