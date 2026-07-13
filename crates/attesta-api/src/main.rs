@@ -16,8 +16,13 @@ mod state;
 use std::sync::Arc;
 
 use attesta_core::{config::Config, db};
+use axum::http::HeaderValue;
 use tokio::sync::broadcast;
-use tower_http::{limit::RequestBodyLimitLayer, trace::TraceLayer};
+use tower_http::{
+    cors::{AllowOrigin, Any, CorsLayer},
+    limit::RequestBodyLimitLayer,
+    trace::TraceLayer,
+};
 use tracing_subscriber::EnvFilter;
 
 use crate::state::AppState;
@@ -50,9 +55,16 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(routes::notes::poll_new_notes(state.clone()));
     tokio::spawn(retention::run(state.clone()));
 
-    let app = routes::router(state)
+    let mut app = routes::router(state)
         .layer(RequestBodyLimitLayer::new(256 * 1024)) // ciphertext blobs are small
         .layer(TraceLayer::new_for_http());
+
+    // Browser provers need CORS; off unless origins are configured.
+    // `CORS_ALLOWED_ORIGINS=*` opens every origin (read API is public
+    // data anyway); otherwise an explicit allowlist.
+    if let Some(cors) = cors_layer(&config.cors_allowed_origins)? {
+        app = app.layer(cors);
+    }
 
     let listener = tokio::net::TcpListener::bind(&config.bind_addr).await?;
     tracing::info!(addr = %config.bind_addr, "attesta-api listening");
@@ -63,4 +75,28 @@ async fn main() -> anyhow::Result<()> {
     )
     .await?;
     Ok(())
+}
+
+fn cors_layer(origins: &[String]) -> anyhow::Result<Option<CorsLayer>> {
+    if origins.is_empty() {
+        return Ok(None);
+    }
+    let allow_origin = if origins.iter().any(|o| o == "*") {
+        AllowOrigin::any()
+    } else {
+        let parsed: Vec<HeaderValue> = origins
+            .iter()
+            .map(|o| {
+                o.parse()
+                    .map_err(|_| anyhow::anyhow!("invalid origin in CORS_ALLOWED_ORIGINS: {o}"))
+            })
+            .collect::<anyhow::Result<_>>()?;
+        AllowOrigin::list(parsed)
+    };
+    Ok(Some(
+        CorsLayer::new()
+            .allow_origin(allow_origin)
+            .allow_methods(Any)
+            .allow_headers(Any),
+    ))
 }
