@@ -83,10 +83,19 @@ pub async fn stream_notes(
         let _held = &slot;
         // Slow subscribers that miss broadcasts just re-sync via /v1/notes.
         let note = msg.ok()?;
-        let event = Event::default().event("note").json_data(&note).ok()?;
-        Some(Ok(event))
+        Some(Ok(note_event(&note)?))
     });
     Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(20))))
+}
+
+/// SSE event for one note. The `id:` field carries the note's monotonic
+/// cursor, so standard `Last-Event-ID` reconnects can resume losslessly.
+fn note_event(note: &EncryptedNoteRow) -> Option<Event> {
+    Event::default()
+        .event("note")
+        .id(note.id.to_string())
+        .json_data(note)
+        .ok()
 }
 
 /// Background task: watch the encrypted_notes table and broadcast new rows
