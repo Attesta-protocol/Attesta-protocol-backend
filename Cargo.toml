@@ -45,6 +45,8 @@ futures = "0.3"
 tokio-stream = { version = "0.1", features = ["sync"] }
 dotenvy = "0.15"
 stellar-xdr = { version = "27", features = ["base64"] }
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.17", default-features = false, features = ["http-listener"] }
 
 [profile.release]
 lto = "thin"

@@ -8,11 +8,15 @@ use attesta_core::{
 use sqlx::PgPool;
 use tokio::sync::{broadcast, Mutex};
 
+use metrics_exporter_prometheus::PrometheusHandle;
+
 use crate::limits::{IpBuckets, SseSlots};
 
 pub struct AppState {
     pub db: PgPool,
     pub config: Config,
+    /// Renders the Prometheus exposition text for GET /metrics.
+    pub metrics: PrometheusHandle,
     /// New encrypted notes are broadcast here for SSE subscribers.
     pub note_tx: broadcast::Sender<EncryptedNoteRow>,
     /// Per-IP budgets for read endpoints.

@@ -52,6 +52,7 @@ pub fn router(state: Arc<AppState>) -> Router {
 
     Router::new()
         .route("/health", get(health))
+        .route("/metrics", get(metrics))
         .route("/v1/notes/stream", get(notes::stream_notes))
         .merge(reads)
         .merge(writes)
@@ -60,4 +61,10 @@ pub fn router(state: Arc<AppState>) -> Router {
 
 async fn health() -> Json<serde_json::Value> {
     Json(json!({ "status": "ok", "service": "attesta-api" }))
+}
+
+/// Prometheus exposition. Pool ids, counts, and timings only — no secrets,
+/// no per-user data (invariant restated in docs/operations.md).
+async fn metrics(axum::extract::State(state): axum::extract::State<Arc<AppState>>) -> String {
+    state.metrics.render()
 }

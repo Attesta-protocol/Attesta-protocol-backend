@@ -40,11 +40,25 @@ async fn main() -> anyhow::Result<()> {
 
     // Note fan-out channel: a lightweight poller watches the encrypted_notes
     // table and broadcasts new rows to SSE subscribers.
+    // Prometheus exposition on GET /metrics. Only pool ids, counts, and
+    // timings are ever recorded — never per-user data (see docs/operations.md).
+    let metrics = metrics_exporter_prometheus::PrometheusBuilder::new().install_recorder()?;
+    tokio::spawn({
+        let handle = metrics.clone();
+        async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                handle.run_upkeep();
+            }
+        }
+    });
+
     let (note_tx, _) = broadcast::channel(1024);
     let rl = &config.rate_limits;
     let state = Arc::new(AppState {
         db: pool,
         config: config.clone(),
+        metrics,
         note_tx,
         read_buckets: limits::IpBuckets::new(rl.read_per_sec, rl.read_burst),
         write_buckets: limits::IpBuckets::new(rl.write_per_sec, rl.write_burst),
