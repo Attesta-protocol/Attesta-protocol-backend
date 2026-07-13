@@ -23,6 +23,10 @@ pub struct Config {
     /// Origins allowed for browser (CORS) access. Empty = no CORS layer.
     /// `*` = any origin (public read API behind a proxy).
     pub cors_allowed_origins: Vec<String>,
+    /// /health/ready also fails if no indexer cursor was updated within
+    /// this many seconds. 0 disables the staleness check (API-only
+    /// deployments, or before any contracts are configured).
+    pub ready_max_indexer_staleness_secs: u32,
 }
 
 /// Per-IP token buckets and quotas. A value of 0 disables that limit.
@@ -90,6 +94,7 @@ impl Config {
                 .filter(|s| !s.is_empty())
                 .map(String::from)
                 .collect(),
+            ready_max_indexer_staleness_secs: env_u32("READY_MAX_INDEXER_STALENESS_SECS", 0),
         })
     }
 }
