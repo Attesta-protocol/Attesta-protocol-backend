@@ -17,6 +17,31 @@ pub struct Config {
     /// Days after `created_at` before an unclaimed delivery is deleted.
     /// 0 disables deletion of unclaimed rows.
     pub credential_retention_unclaimed_days: u32,
+    /// Abuse-protection knobs. Every limit can be disabled (0) for private
+    /// deployments; defaults assume a publicly exposed self-hosted API.
+    pub rate_limits: RateLimits,
+    /// Origins allowed for browser (CORS) access. Empty = no CORS layer.
+    /// `*` = any origin (public read API behind a proxy).
+    pub cors_allowed_origins: Vec<String>,
+}
+
+/// Per-IP token buckets and quotas. A value of 0 disables that limit.
+#[derive(Debug, Clone)]
+pub struct RateLimits {
+    /// Sustained read requests per second per IP.
+    pub read_per_sec: u32,
+    /// Read burst size per IP.
+    pub read_burst: u32,
+    /// Sustained write requests per second per IP.
+    pub write_per_sec: u32,
+    /// Write burst size per IP.
+    pub write_burst: u32,
+    /// Max concurrent SSE connections per IP.
+    pub sse_per_ip: u32,
+    /// Max concurrent SSE connections in total.
+    pub sse_global: u32,
+    /// Max credential deliveries per issuer per hour.
+    pub issuer_deliveries_per_hour: u32,
 }
 
 impl Config {
@@ -49,6 +74,22 @@ impl Config {
                 "CREDENTIAL_RETENTION_UNCLAIMED_DAYS",
                 180,
             ),
+            rate_limits: RateLimits {
+                read_per_sec: env_u32("RATE_LIMIT_READ_PER_SEC", 50),
+                read_burst: env_u32("RATE_LIMIT_READ_BURST", 200),
+                write_per_sec: env_u32("RATE_LIMIT_WRITE_PER_SEC", 2),
+                write_burst: env_u32("RATE_LIMIT_WRITE_BURST", 20),
+                sse_per_ip: env_u32("RATE_LIMIT_SSE_PER_IP", 10),
+                sse_global: env_u32("RATE_LIMIT_SSE_GLOBAL", 1000),
+                issuer_deliveries_per_hour: env_u32("RATE_LIMIT_ISSUER_DELIVERIES_PER_HOUR", 600),
+            },
+            cors_allowed_origins: env::var("CORS_ALLOWED_ORIGINS")
+                .unwrap_or_default()
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect(),
         })
     }
 }
