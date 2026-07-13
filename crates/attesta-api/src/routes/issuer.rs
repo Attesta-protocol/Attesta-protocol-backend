@@ -14,7 +14,9 @@ use axum::{
     Json,
 };
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::{error::ApiError, state::AppState};
@@ -107,6 +109,68 @@ pub async fn deliver_credential(
         StatusCode::CREATED,
         Json(DeliverCredentialResponse { delivery_id }),
     ))
+}
+
+#[derive(Deserialize)]
+pub struct ClaimRequest {
+    /// Base64 claim token recovered from inside the decrypted payload.
+    pub claim_token: String,
+}
+
+/// POST /v1/credentials/{delivery_id}/claim
+///
+/// Marks a delivery claimed so it drops out of pickup results. The caller
+/// proves they are the true recipient by presenting the preimage of the
+/// `claim_token_hash` the issuer stored at delivery time — the token
+/// travels inside the encrypted payload, so producing it is exactly as
+/// hard as breaking the encryption (docs/credential-mailbox.md).
+pub async fn claim_delivery(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(delivery_id): axum::extract::Path<Uuid>,
+    Json(req): Json<ClaimRequest>,
+) -> Result<StatusCode, ApiError> {
+    let token = B64
+        .decode(&req.claim_token)
+        .map_err(|_| ApiError::bad_request("claim_token must be base64"))?;
+    if token.is_empty() || token.len() > 128 {
+        return Err(ApiError::bad_request("claim_token size out of bounds"));
+    }
+    let presented_hash: [u8; 32] = Sha256::digest(&token).into();
+
+    let row: Option<(Option<Vec<u8>>, Option<DateTime<Utc>>)> = sqlx::query_as(
+        "SELECT claim_token_hash, claimed_at FROM credential_deliveries
+         WHERE delivery_id = $1",
+    )
+    .bind(delivery_id)
+    .fetch_optional(&state.db)
+    .await?;
+    let (stored_hash, claimed_at) = row.ok_or_else(|| ApiError::not_found("unknown delivery"))?;
+
+    if claimed_at.is_some() {
+        return Err(ApiError::conflict("delivery already claimed"));
+    }
+    // Constant-time equality is unnecessary here: the compared values are
+    // hashes, and a mismatch reveals nothing about the stored preimage.
+    let authorized = stored_hash
+        .as_deref()
+        .is_some_and(|h| h == presented_hash.as_slice());
+    if !authorized {
+        return Err(ApiError::forbidden("claim token does not match"));
+    }
+
+    // Guard claimed_at IS NULL again in the UPDATE so a concurrent claim
+    // race resolves to exactly one winner.
+    let updated = sqlx::query(
+        "UPDATE credential_deliveries SET claimed_at = now()
+         WHERE delivery_id = $1 AND claimed_at IS NULL",
+    )
+    .bind(delivery_id)
+    .execute(&state.db)
+    .await?;
+    if updated.rows_affected() == 0 {
+        return Err(ApiError::conflict("delivery already claimed"));
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[derive(Deserialize)]

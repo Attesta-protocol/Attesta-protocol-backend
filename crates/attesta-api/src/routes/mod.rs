@@ -23,6 +23,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/notes/stream", get(notes::stream_notes))
         .route("/v1/issuer/credentials", post(issuer::deliver_credential))
         .route("/v1/credentials", get(issuer::list_deliveries))
+        .route(
+            "/v1/credentials/{delivery_id}/claim",
+            post(issuer::claim_delivery),
+        )
         .route("/v1/issuers", get(issuer::list_issuers))
         .route("/v1/stats", get(stats::get_stats))
         .route(
