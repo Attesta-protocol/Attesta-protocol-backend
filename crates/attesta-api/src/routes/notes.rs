@@ -169,9 +169,18 @@ fn note_event(note: &EncryptedNoteRow) -> Option<Event> {
         .ok()
 }
 
-/// Background task: watch the encrypted_notes table and broadcast new rows
-/// to SSE subscribers. DB polling keeps the API and indexer fully decoupled
-/// (they can run as separate processes/containers).
+/// Poll cadence when LISTEN is unavailable, and the safety-net re-check
+/// interval while it is (covers dropped notifications).
+const POLL_INTERVAL: Duration = Duration::from_secs(2);
+const LISTEN_SAFETY_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Background task: broadcast newly indexed encrypted notes to SSE
+/// subscribers. Prefers Postgres LISTEN/NOTIFY (push latency, no idle
+/// queries; the API and indexer still share only the database), degrading
+/// to the 2 s table poll whenever the LISTEN connection is unavailable —
+/// the stream never goes down with it. Notifications are treated purely
+/// as wake-ups: rows are always read by cursor, so coalesced or dropped
+/// notifications cannot skip notes.
 pub async fn poll_new_notes(state: Arc<AppState>) {
     let mut last_id: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(id), 0) FROM encrypted_notes")
         .fetch_one(&state.db)
@@ -179,26 +188,63 @@ pub async fn poll_new_notes(state: Arc<AppState>) {
         .unwrap_or(0);
 
     loop {
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        if state.note_tx.receiver_count() == 0 {
-            continue;
+        match listen(&state, &mut last_id).await {
+            Ok(()) => unreachable!("listen loop only exits with an error"),
+            Err(e) => {
+                tracing::warn!(error = %e, "LISTEN unavailable; falling back to polling");
+            }
         }
+        // Poll for a while, then try to re-establish LISTEN.
+        for _ in 0..15 {
+            tokio::time::sleep(POLL_INTERVAL).await;
+            drain_new_notes(&state, &mut last_id).await;
+        }
+    }
+}
+
+/// Push mode: wake on NOTIFY (or the safety interval) and drain.
+async fn listen(state: &Arc<AppState>, last_id: &mut i64) -> Result<(), sqlx::Error> {
+    let mut listener = sqlx::postgres::PgListener::connect_with(&state.db).await?;
+    listener.listen("attesta_notes").await?;
+    tracing::info!("note fan-out in push mode (LISTEN attesta_notes)");
+
+    loop {
+        // Drain first: covers rows inserted before LISTEN was set up and
+        // any notifications lost while reconnecting.
+        drain_new_notes(state, last_id).await;
+        match tokio::time::timeout(LISTEN_SAFETY_INTERVAL, listener.recv()).await {
+            Ok(Ok(_notification)) => {} // wake → drain on next iteration
+            Ok(Err(e)) => return Err(e),
+            Err(_elapsed) => {} // safety-net poll
+        }
+    }
+}
+
+async fn drain_new_notes(state: &Arc<AppState>, last_id: &mut i64) {
+    loop {
         let rows: Result<Vec<EncryptedNoteRow>, _> = sqlx::query_as(
             "SELECT id, pool, commitment, ephemeral_pubkey, ciphertext, ledger, tx_hash
              FROM encrypted_notes WHERE id > $1 ORDER BY id LIMIT 1000",
         )
-        .bind(last_id)
+        .bind(*last_id)
         .fetch_all(&state.db)
         .await;
 
         match rows {
             Ok(rows) => {
+                let full_page = rows.len() == 1000;
                 for note in rows {
-                    last_id = note.id;
+                    *last_id = note.id;
                     let _ = state.note_tx.send(note);
                 }
+                if !full_page {
+                    return;
+                }
             }
-            Err(e) => tracing::warn!(error = %e, "note poller query failed"),
+            Err(e) => {
+                tracing::warn!(error = %e, "note fan-out query failed");
+                return;
+            }
         }
     }
 }
