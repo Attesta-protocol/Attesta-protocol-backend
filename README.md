@@ -294,9 +294,15 @@ GET  /v1/tree/{pool}/root                  → { pool, root, leaf_count, anchore
 GET  /v1/notes?since_cursor=&pool=         → { notes: […], next_cursor } (500/page)
 GET  /v1/notes/stream                      → SSE, event: note, 20 s keep-alive
 POST /v1/issuer/credentials                → { issuer_id, recipient_hint,
-                                               ciphertext (b64), issuer_signature (b64) }
+                                               ciphertext (b64), issuer_signature (b64),
+                                               claim_token_hash (b64, optional) }
                                              → 201 { delivery_id }
-GET  /v1/credentials?recipient_hint=       → unclaimed deliveries for a mailbox tag
+GET  /v1/credentials?recipient_hint=&since_cursor=
+                                           → { deliveries: […], next_cursor } (200/page,
+                                             unclaimed only; idempotent, read-only)
+POST /v1/credentials/{delivery_id}/claim   → { claim_token (b64) } → 204
+                                             (403 wrong token, 409 already claimed;
+                                              see docs/credential-mailbox.md)
 GET  /v1/issuers                           → non-revoked issuer registry mirror
 GET  /v1/stats                             → { pools: [{pool, asset, tvl}], counts… }
 GET  /v1/artifacts/{circuit}/{version}     → manifest.json (file list + sha256)
