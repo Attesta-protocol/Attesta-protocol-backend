@@ -413,6 +413,20 @@ cargo run --bin disclosure -- verify report.json
       root, O(depth) paths — plus a per-pool in-memory tree cache in the API
       that tops up from the `commitments` table instead of rebuilding per
       request
+- [x] Historical root anchoring (ISSUES.md #5): replayable `tree_roots`
+      history, `/root?at_ledger=` / `?at_leaf_count=`, `leaf_count` pinned
+      into path responses
+- [x] Credential mailbox lifecycle (#6): claim-token claims, paginated
+      pickup, configurable retention (`docs/credential-mailbox.md`)
+- [x] Abuse protection (#7): per-IP read/write token buckets, SSE
+      connection caps, per-issuer hourly quota, CORS allowlist — all
+      env-tunable, `0` disables
+- [x] SSE resume + push fan-out (#8): `Last-Event-ID` replay without gaps
+      or duplicates, LISTEN/NOTIFY latency with a polling safety net,
+      `resync` events for lagging consumers
+- [x] Observability (#9): Prometheus metrics on API and (opt-in) indexer,
+      indexer lag/undecodable-event counters, `/health/live` +
+      `/health/ready`, container healthchecks (`docs/operations.md`)
 - [ ] Poseidon-over-BLS12-381 tree hasher matching the circuits
       (`crates/attesta-core/src/merkle.rs` — currently a SHA-256 placeholder
       behind the `TreeHasher` trait; **security-critical**, dual review)
