@@ -89,6 +89,25 @@ pub async fn deliver_credential(
     // to be finalized (see docs/credential-format.md when it lands).
     let _ = &issuer.public_key;
 
+    // Per-issuer hourly quota (0 = unlimited): one compromised or buggy
+    // issuer key cannot flood the mailbox table. Sliding window over the
+    // rows themselves — no extra state to keep consistent.
+    let quota = state.config.rate_limits.issuer_deliveries_per_hour;
+    if quota > 0 {
+        let delivered: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM credential_deliveries
+             WHERE issuer_id = $1 AND created_at > now() - interval '1 hour'",
+        )
+        .bind(&req.issuer_id)
+        .fetch_one(&state.db)
+        .await?;
+        if delivered >= quota as i64 {
+            return Err(ApiError::too_many_requests(
+                "issuer hourly delivery quota exceeded",
+            ));
+        }
+    }
+
     let delivery_id = Uuid::new_v4();
     sqlx::query(
         "INSERT INTO credential_deliveries
