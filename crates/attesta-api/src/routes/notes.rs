@@ -8,7 +8,7 @@ use axum::{
     extract::{ConnectInfo, Query, State},
     response::{
         sse::{Event, KeepAlive, Sse},
-        Response,
+        IntoResponse, Response,
     },
     Json,
 };
@@ -63,7 +63,25 @@ pub async fn list_notes(
     Ok(Json(NotesPage { notes, next_cursor }))
 }
 
+/// Cap on rows replayed inline on reconnect; beyond this the client is
+/// told to re-page via /v1/notes with a `resync` event.
+const REPLAY_LIMIT: i64 = 5_000;
+
+#[derive(Deserialize)]
+pub struct StreamQuery {
+    /// Equivalent to the Last-Event-ID header, for clients (e.g. curl or
+    /// EventSource polyfills) that cannot set it.
+    pub since_cursor: Option<i64>,
+}
+
 /// GET /v1/notes/stream — SSE stream of newly indexed encrypted notes.
+///
+/// Resumable: events carry `id:`, and a reconnect with `Last-Event-ID: N`
+/// (or `?since_cursor=N`) first replays every stored note with `id > N`
+/// in order, then continues live — no gaps, no duplicates (the live
+/// broadcast is subscribed *before* the replay query, and overlap is
+/// deduped by cursor). If more than REPLAY_LIMIT rows are pending, a
+/// `resync` event tells the client to re-page via /v1/notes instead.
 ///
 /// Concurrent connections are capped per IP and globally (429 +
 /// Retry-After when exhausted); each connection holds one RAII slot that
@@ -72,20 +90,73 @@ pub async fn list_notes(
 pub async fn stream_notes(
     State(state): State<Arc<AppState>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Query(q): Query<StreamQuery>,
+    headers: axum::http::HeaderMap,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, Response> {
     let Some(slot) = state.sse_slots.try_acquire(addr.ip()) else {
         return Err(too_many_requests(30));
     };
 
+    let resume_from = headers
+        .get("last-event-id")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<i64>().ok())
+        .or(q.since_cursor);
+
+    // Subscribe before the replay query so nothing inserted in between is
+    // lost; the overlap is deduped by cursor below.
     let rx = state.note_tx.subscribe();
-    let stream = BroadcastStream::new(rx).filter_map(move |msg| {
+
+    let (replay, mut last_seen) = match resume_from {
+        Some(cursor) => {
+            let rows: Vec<EncryptedNoteRow> = sqlx::query_as(
+                "SELECT id, pool, commitment, ephemeral_pubkey, ciphertext, ledger, tx_hash
+                 FROM encrypted_notes WHERE id > $1 ORDER BY id LIMIT $2",
+            )
+            .bind(cursor)
+            .bind(REPLAY_LIMIT)
+            .fetch_all(&state.db)
+            .await
+            .map_err(|e| ApiError::from(e).into_response())?;
+
+            let overflow = rows.len() as i64 == REPLAY_LIMIT;
+            let last = rows.last().map(|n| n.id).unwrap_or(cursor);
+            let mut events: Vec<Result<Event, Infallible>> =
+                rows.iter().filter_map(note_event).map(Ok).collect();
+            if overflow {
+                events.push(Ok(resync_event()));
+            }
+            (events, last)
+        }
+        None => (Vec::new(), 0),
+    };
+
+    let live = BroadcastStream::new(rx).filter_map(move |msg| {
         // The closure owns the slot; it drops when the stream does.
         let _held = &slot;
-        // Slow subscribers that miss broadcasts just re-sync via /v1/notes.
-        let note = msg.ok()?;
-        Some(Ok(note_event(&note)?))
+        match msg {
+            Ok(note) => {
+                // Dedup the replay/live overlap: cursors are monotonic.
+                if note.id <= last_seen {
+                    return None;
+                }
+                last_seen = note.id;
+                Some(Ok(note_event(&note)?))
+            }
+            // Slow consumer overflowed the broadcast buffer: tell it to
+            // re-page via /v1/notes instead of silently missing notes.
+            Err(_lagged) => Some(Ok(resync_event())),
+        }
     });
+
+    let stream = futures::stream::iter(replay).chain(live);
     Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(20))))
+}
+
+/// Tells well-behaved clients to re-page via /v1/notes from their last
+/// processed cursor before trusting the live stream again.
+fn resync_event() -> Event {
+    Event::default().event("resync").data("re-page /v1/notes")
 }
 
 /// SSE event for one note. The `id:` field carries the note's monotonic
