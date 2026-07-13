@@ -29,6 +29,10 @@ pub struct PathResponse {
     pub pool: String,
     pub leaf_index: i64,
     pub root: String,
+    /// Tree size when this path was computed. Lets clients pin
+    /// path ↔ root ↔ ledger consistently and re-fetch the same root later
+    /// via `/root?at_leaf_count=`.
+    pub leaf_count: i64,
     /// Ledger the newest indexed leaf was observed at — the block anchor
     /// clients pin their proof to.
     pub anchored_ledger: i64,
@@ -73,6 +77,7 @@ pub async fn get_path(
         pool,
         leaf_index: leaf_index as i64,
         root: hex0x(&pool_tree.tree.root()),
+        leaf_count: pool_tree.tree.len() as i64,
         anchored_ledger: pool_tree.anchored_ledger,
         path: path
             .into_iter()
