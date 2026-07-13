@@ -11,6 +11,12 @@ pub struct Config {
     pub registry_contract_id: Option<String>,
     pub indexer_poll_secs: u64,
     pub artifacts_dir: String,
+    /// Days after `claimed_at` before a claimed delivery is deleted.
+    /// 0 disables deletion of claimed rows.
+    pub credential_retention_claimed_days: u32,
+    /// Days after `created_at` before an unclaimed delivery is deleted.
+    /// 0 disables deletion of unclaimed rows.
+    pub credential_retention_unclaimed_days: u32,
 }
 
 impl Config {
@@ -38,6 +44,18 @@ impl Config {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(5),
             artifacts_dir: env::var("ARTIFACTS_DIR").unwrap_or_else(|_| "./artifacts".into()),
+            credential_retention_claimed_days: env_u32("CREDENTIAL_RETENTION_CLAIMED_DAYS", 30),
+            credential_retention_unclaimed_days: env_u32(
+                "CREDENTIAL_RETENTION_UNCLAIMED_DAYS",
+                180,
+            ),
         })
     }
+}
+
+fn env_u32(key: &str, default: u32) -> u32 {
+    env::var(key)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
 }

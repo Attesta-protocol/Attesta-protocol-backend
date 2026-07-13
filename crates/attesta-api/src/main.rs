@@ -8,6 +8,7 @@
 //! or an unencrypted credential. Ciphertext in, ciphertext out.
 
 mod error;
+mod retention;
 mod routes;
 mod state;
 
@@ -42,6 +43,7 @@ async fn main() -> anyhow::Result<()> {
     });
 
     tokio::spawn(routes::notes::poll_new_notes(state.clone()));
+    tokio::spawn(retention::run(state.clone()));
 
     let app = routes::router(state)
         .layer(RequestBodyLimitLayer::new(256 * 1024)) // ciphertext blobs are small
