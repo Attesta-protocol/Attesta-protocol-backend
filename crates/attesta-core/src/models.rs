@@ -55,6 +55,8 @@ pub struct IssuerRow {
 /// An encrypted credential waiting for its recipient to collect it.
 #[derive(Debug, Clone, FromRow, Serialize)]
 pub struct CredentialDeliveryRow {
+    /// Monotonic pickup cursor (same contract as `EncryptedNoteRow::id`).
+    pub seq: i64,
     pub delivery_id: Uuid,
     pub issuer_id: String,
     pub recipient_hint: String,

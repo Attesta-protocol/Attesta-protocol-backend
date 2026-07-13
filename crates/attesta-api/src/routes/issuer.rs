@@ -137,7 +137,8 @@ pub async fn claim_delivery(
     }
     let presented_hash: [u8; 32] = Sha256::digest(&token).into();
 
-    let row: Option<(Option<Vec<u8>>, Option<DateTime<Utc>>)> = sqlx::query_as(
+    type ClaimStateRow = (Option<Vec<u8>>, Option<DateTime<Utc>>);
+    let row: Option<ClaimStateRow> = sqlx::query_as(
         "SELECT claim_token_hash, claimed_at FROM credential_deliveries
          WHERE delivery_id = $1",
     )
@@ -173,28 +174,57 @@ pub async fn claim_delivery(
     Ok(StatusCode::NO_CONTENT)
 }
 
+const DELIVERIES_PAGE_SIZE: i64 = 200;
+
 #[derive(Deserialize)]
 pub struct ListDeliveriesQuery {
     pub recipient_hint: String,
+    /// Resume cursor from a previous page (exclusive), same contract as
+    /// /v1/notes.
+    pub since_cursor: Option<i64>,
 }
 
-/// GET /v1/credentials?recipient_hint= — recipient-side pickup of encrypted
-/// credential blobs. Decryption (and thus access control) is client-side:
-/// a wrong recipient fetches undecryptable ciphertext.
+#[derive(Serialize)]
+pub struct DeliveriesPage {
+    pub deliveries: Vec<CredentialDeliveryRow>,
+    /// Pass as since_cursor to fetch the next page. Absent on the last page.
+    pub next_cursor: Option<i64>,
+}
+
+/// GET /v1/credentials?recipient_hint=&since_cursor= — recipient-side
+/// pickup of encrypted credential blobs, paginated by the monotonic `seq`
+/// column. Pickup is idempotent and read-only; deliveries leave the
+/// mailbox only via an authorized claim (see `claim_delivery`) or
+/// retention. Decryption (and thus access control) is client-side: a
+/// wrong recipient fetches undecryptable ciphertext.
 pub async fn list_deliveries(
     State(state): State<Arc<AppState>>,
     Query(q): Query<ListDeliveriesQuery>,
-) -> Result<Json<Vec<CredentialDeliveryRow>>, ApiError> {
-    let rows: Vec<CredentialDeliveryRow> = sqlx::query_as(
-        "SELECT delivery_id, issuer_id, recipient_hint, ciphertext, issuer_signature, created_at
+) -> Result<Json<DeliveriesPage>, ApiError> {
+    let since = q.since_cursor.unwrap_or(0);
+    let deliveries: Vec<CredentialDeliveryRow> = sqlx::query_as(
+        "SELECT seq, delivery_id, issuer_id, recipient_hint, ciphertext,
+                issuer_signature, created_at
          FROM credential_deliveries
-         WHERE recipient_hint = $1 AND claimed_at IS NULL
-         ORDER BY created_at",
+         WHERE recipient_hint = $1 AND claimed_at IS NULL AND seq > $2
+         ORDER BY seq
+         LIMIT $3",
     )
     .bind(&q.recipient_hint)
+    .bind(since)
+    .bind(DELIVERIES_PAGE_SIZE)
     .fetch_all(&state.db)
     .await?;
-    Ok(Json(rows))
+
+    let next_cursor = if deliveries.len() as i64 == DELIVERIES_PAGE_SIZE {
+        deliveries.last().map(|d| d.seq)
+    } else {
+        None
+    };
+    Ok(Json(DeliveriesPage {
+        deliveries,
+        next_cursor,
+    }))
 }
 
 /// GET /v1/issuers — active issuer registry mirror.
