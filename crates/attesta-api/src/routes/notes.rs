@@ -1,19 +1,22 @@
 //! Encrypted-note relay. Serves ciphertext blobs; recipients trial-decrypt
 //! client-side with their viewing keys. This service cannot read a note.
 
-use std::{convert::Infallible, sync::Arc, time::Duration};
+use std::{convert::Infallible, net::SocketAddr, sync::Arc, time::Duration};
 
 use attesta_core::models::EncryptedNoteRow;
 use axum::{
-    extract::{Query, State},
-    response::sse::{Event, KeepAlive, Sse},
+    extract::{ConnectInfo, Query, State},
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        Response,
+    },
     Json,
 };
 use futures::Stream;
 use serde::{Deserialize, Serialize};
 use tokio_stream::{wrappers::BroadcastStream, StreamExt};
 
-use crate::{error::ApiError, state::AppState};
+use crate::{error::ApiError, limits::too_many_requests, state::AppState};
 
 const PAGE_SIZE: i64 = 500;
 
@@ -61,17 +64,29 @@ pub async fn list_notes(
 }
 
 /// GET /v1/notes/stream — SSE stream of newly indexed encrypted notes.
+///
+/// Concurrent connections are capped per IP and globally (429 +
+/// Retry-After when exhausted); each connection holds one RAII slot that
+/// is released when the stream drops, so one client cannot starve other
+/// subscribers.
 pub async fn stream_notes(
     State(state): State<Arc<AppState>>,
-) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, Response> {
+    let Some(slot) = state.sse_slots.try_acquire(addr.ip()) else {
+        return Err(too_many_requests(30));
+    };
+
     let rx = state.note_tx.subscribe();
-    let stream = BroadcastStream::new(rx).filter_map(|msg| {
+    let stream = BroadcastStream::new(rx).filter_map(move |msg| {
+        // The closure owns the slot; it drops when the stream does.
+        let _held = &slot;
         // Slow subscribers that miss broadcasts just re-sync via /v1/notes.
         let note = msg.ok()?;
         let event = Event::default().event("note").json_data(&note).ok()?;
         Some(Ok(event))
     });
-    Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(20)))
+    Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(20))))
 }
 
 /// Background task: watch the encrypted_notes table and broadcast new rows
