@@ -1,6 +1,6 @@
 # Attesta Backend — Issue Backlog
 
-Ten proposed issues toward the M2–M5 milestones, grounded in the current
+Ten proposed issues toward the M2–M5 milestones (5–9 are now implemented; status notes inline), grounded in the current
 code. Each is written to be copy-pasted into the tracker as-is. Labels
 follow the conventions in CONTRIBUTING: `security-critical` items require
 dual review; the no-secrets-server invariant applies to every issue here.
@@ -224,6 +224,8 @@ it needs).
 
 ## Issue 5 — Historical root anchoring: root history table and `/v1/tree/{pool}/root?at_ledger=` support
 
+**Status: implemented.** API owns root computation (persists a row per appended leaf during tree top-up, batched); `/root?at_ledger=` and `?at_leaf_count=` answer from `tree_roots` by index lookup; path responses carry `leaf_count`. Backfill is automatic: a fresh API process replays all leaves on first tree request.
+
 **Labels:** `backend`, `api`, `indexer`, `M2`
 
 ### Description
@@ -274,6 +276,8 @@ drop-the-database recovery property.
 ---
 
 ## Issue 6 — Credential mailbox lifecycle: claim endpoint, idempotent pickup, retention
+
+**Status: implemented.** Claim tokens per `docs/credential-mailbox.md`; `POST /v1/credentials/{id}/claim` (403/409 semantics verified end-to-end); pickup paginated by a new `seq` cursor; hourly retention sweeper with `CREDENTIAL_RETENTION_*` knobs (0 disables).
 
 **Labels:** `backend`, `api`, `M5`
 
@@ -330,6 +334,8 @@ impossible without breaking the encryption.
 
 ## Issue 7 — Abuse protection on the write path: rate limits, quotas, and body hygiene
 
+**Status: implemented.** Hand-rolled per-IP token buckets (separate read/write budgets), SSE per-IP/global connection slots released on drop, per-issuer hourly quota, CORS allowlist. All `RATE_LIMIT_*`/`CORS_ALLOWED_ORIGINS` env-tunable; 0 disables. 429s carry `Retry-After` + ApiError JSON shape.
+
 **Labels:** `backend`, `api`, `hardening`
 
 ### Description
@@ -380,6 +386,8 @@ with sane limits by default rather than assuming a reverse proxy.
 
 ## Issue 8 — SSE resume with Last-Event-ID and push-based note fan-out
 
+**Status: implemented.** Events carry `id:`; `Last-Event-ID`/`?since_cursor=` replay is subscribe-then-fetch with cursor dedup (no gaps, no duplicates, verified); LISTEN/NOTIFY push with a polling safety net and fallback; `resync` events on lag or replay overflow.
+
 **Labels:** `backend`, `api`, `enhancement`
 
 ### Description
@@ -429,6 +437,8 @@ fixes natural.
 ---
 
 ## Issue 9 — Observability: Prometheus metrics, indexer lag, and a real readiness probe
+
+**Status: implemented** (metrics + probes; see `docs/operations.md`). API `/metrics`, opt-in indexer listener via `INDEXER_METRICS_ADDR`, lag/undecodable/sync-error series, `/health/live` + `/health/ready` (DB check + optional indexer staleness), container healthchecks on readiness.
 
 **Labels:** `backend`, `api`, `indexer`, `operations`
 
