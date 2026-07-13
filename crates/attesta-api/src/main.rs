@@ -12,6 +12,7 @@ mod limits;
 mod retention;
 mod routes;
 mod state;
+mod telemetry;
 
 use std::sync::Arc;
 
@@ -70,6 +71,7 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(retention::run(state.clone()));
 
     let mut app = routes::router(state)
+        .layer(axum::middleware::from_fn(telemetry::track_requests))
         .layer(RequestBodyLimitLayer::new(256 * 1024)) // ciphertext blobs are small
         .layer(TraceLayer::new_for_http());
 
