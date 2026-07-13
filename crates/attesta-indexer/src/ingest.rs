@@ -21,9 +21,16 @@ pub async fn run(db: PgPool, client: SorobanClient, config: Config) -> anyhow::R
 
     loop {
         for contract_id in &contracts {
+            let started = std::time::Instant::now();
             if let Err(e) = sync_contract(&db, &client, contract_id).await {
                 tracing::warn!(contract = %contract_id, error = %e, "sync failed; will retry");
+                metrics::counter!("attesta_indexer_sync_errors_total",
+                    "contract" => contract_id.clone())
+                .increment(1);
             }
+            metrics::histogram!("attesta_indexer_sync_duration_seconds",
+                "contract" => contract_id.clone())
+            .record(started.elapsed().as_secs_f64());
         }
         tokio::time::sleep(poll).await;
     }
@@ -50,6 +57,15 @@ async fn sync_contract(
         for raw in &page.events {
             if let Some(event) = decode(raw) {
                 store_event(db, contract_id, raw.ledger as i64, &raw.tx_hash, event).await?;
+                metrics::counter!("attesta_indexer_events_decoded_total",
+                    "contract" => contract_id.to_owned())
+                .increment(1);
+            } else {
+                // Undecodable events are a loud signal: either layout
+                // drift against the deployed contracts or corrupt input.
+                metrics::counter!("attesta_indexer_events_undecodable_total",
+                    "contract" => contract_id.to_owned())
+                .increment(1);
             }
             last_ledger = last_ledger.max(raw.ledger as i64);
         }
@@ -58,6 +74,14 @@ async fn sync_contract(
         cursor = page.cursor.clone();
         if done {
             last_ledger = last_ledger.max(page.latest_ledger as i64);
+        }
+
+        // Ingest lag: how far the cursor trails the chain head. ~0 when
+        // caught up; grows when the RPC outpaces us (or we are stuck).
+        if page.latest_ledger > 0 {
+            metrics::gauge!("attesta_indexer_lag_ledgers",
+                "contract" => contract_id.to_owned())
+            .set((page.latest_ledger as i64 - last_ledger).max(0) as f64);
         }
 
         sqlx::query(

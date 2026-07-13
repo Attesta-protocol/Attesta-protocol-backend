@@ -165,6 +165,8 @@ dependencies = [
  "base64",
  "dotenvy",
  "hex",
+ "metrics",
+ "metrics-exporter-prometheus",
  "reqwest",
  "serde",
  "serde_json",

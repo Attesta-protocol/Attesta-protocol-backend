@@ -24,6 +24,20 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let config = Config::from_env()?;
+
+    // Metrics listener is opt-in (separate port, no default exposure):
+    // set INDEXER_METRICS_ADDR=0.0.0.0:9464 to scrape. Pool ids, counts,
+    // and timings only — never per-user data.
+    if let Ok(addr) = std::env::var("INDEXER_METRICS_ADDR") {
+        let addr: std::net::SocketAddr = addr
+            .parse()
+            .map_err(|e| anyhow::anyhow!("invalid INDEXER_METRICS_ADDR: {e}"))?;
+        metrics_exporter_prometheus::PrometheusBuilder::new()
+            .with_http_listener(addr)
+            .install()?;
+        tracing::info!(%addr, "indexer metrics listener up");
+    }
+
     let pool = db::connect(&config.database_url).await?;
     db::migrate(&pool).await?;
 
