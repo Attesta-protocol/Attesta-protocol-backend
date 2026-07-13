@@ -117,6 +117,10 @@ async fn sync_pool_tree<'a>(
     .fetch_all(&state.db)
     .await?;
 
+    // Root history rows accumulated while appending; flushed in one batch
+    // below so a large backfill is not one INSERT per leaf.
+    let mut new_roots: Vec<(i64, Vec<u8>, i64)> = Vec::new();
+
     for (leaf_index, bytes, ledger) in rows {
         // Leaves must arrive contiguously; a gap means the indexer is
         // mid-backfill (or missed events). Serve what we have up to it —
@@ -136,6 +140,30 @@ async fn sync_pool_tree<'a>(
         let idx = pool_tree.tree.append(node);
         pool_tree.index_by_commitment.insert(node, idx);
         pool_tree.anchored_ledger = pool_tree.anchored_ledger.max(ledger);
+        new_roots.push((
+            pool_tree.tree.len() as i64,
+            pool_tree.tree.root().to_vec(),
+            ledger,
+        ));
+    }
+
+    // Persist the root-after-each-append history (Issue 5). The tree is
+    // append-only, so these rows are deterministic and idempotent: replays
+    // after a database drop reproduce identical values, and ON CONFLICT
+    // keeps concurrent requests from racing.
+    if !new_roots.is_empty() {
+        let (leaf_counts, roots, ledgers): (Vec<i64>, Vec<Vec<u8>>, Vec<i64>) = unzip3(new_roots);
+        sqlx::query(
+            "INSERT INTO tree_roots (pool, leaf_count, root, ledger)
+             SELECT $1, * FROM UNNEST($2::bigint[], $3::bytea[], $4::bigint[])
+             ON CONFLICT (pool, leaf_count) DO NOTHING",
+        )
+        .bind(pool)
+        .bind(&leaf_counts)
+        .bind(&roots)
+        .bind(&ledgers)
+        .execute(&state.db)
+        .await?;
     }
 
     if pool_tree.tree.is_empty() {
@@ -144,6 +172,18 @@ async fn sync_pool_tree<'a>(
         )));
     }
     Ok(pool_tree)
+}
+
+fn unzip3<A, B, C>(v: Vec<(A, B, C)>) -> (Vec<A>, Vec<B>, Vec<C>) {
+    let mut a = Vec::with_capacity(v.len());
+    let mut b = Vec::with_capacity(v.len());
+    let mut c = Vec::with_capacity(v.len());
+    for (x, y, z) in v {
+        a.push(x);
+        b.push(y);
+        c.push(z);
+    }
+    (a, b, c)
 }
 
 fn parse_node(s: &str) -> Result<Node, ApiError> {
