@@ -15,9 +15,12 @@ Stellar Protocol 25's zero-knowledge primitives (BLS12-381 on Soroban).
 - [The components in detail](#the-components-in-detail)
 - [Data model](#data-model)
 - [API reference](#api-reference)
+- [Abuse protection](#abuse-protection)
+- [Operations & observability](#operations--observability)
 - [Development setup](#development-setup)
 - [Design decisions](#design-decisions)
 - [Status / TODO toward M2](#status--todo-toward-m2-shielded-pool-mvp)
+- [Issue backlogs](#issue-backlogs)
 - [Contributing](#contributing)
 
 ## What Attesta does
@@ -95,6 +98,7 @@ receive against on-chain state.
 | `crates/attesta-core` | — | Shared config, DB layer, models, incremental Merkle tree |
 | `migrations/` | — | PostgreSQL schema (public chain state + ciphertext only) |
 | `artifacts/` | — | Versioned proving keys / WASM provers served with published hashes |
+| `docs/` | — | Design and ops docs: [credential-mailbox.md](docs/credential-mailbox.md), [operations.md](docs/operations.md) |
 
 The API and indexer are separate processes that share only the database.
 Either can restart, crash, or be scaled independently; neither calls the
@@ -158,13 +162,27 @@ subtracts from `pool_totals`.
    **issuer gateway** (`POST /v1/issuer/credentials`) along with an opaque
    `recipient_hint` — a mailbox tag the recipient derived, not an
    identity.
-3. The recipient polls `GET /v1/credentials?recipient_hint=…` and decrypts
-   locally. Later, they can prove facts *about* the credential inside a ZK
-   proof without showing the credential itself.
+3. The recipient pages `GET /v1/credentials?recipient_hint=…` (cursor
+   pagination, unclaimed rows only) and decrypts locally. Later, they can
+   prove facts *about* the credential inside a ZK proof without showing
+   the credential itself.
+4. **Claiming.** Pickup is deliberately idempotent and read-only — anyone
+   who guesses a hint gets only undecryptable ciphertext and cannot make
+   mail disappear. To remove a delivery from the mailbox, the recipient
+   presents a **claim token** that traveled *inside* the encrypted
+   payload (the issuer stored only its SHA-256 at delivery time):
+   `POST /v1/credentials/{id}/claim`. Producing the token is exactly as
+   hard as breaking the encryption, so malicious claiming is impossible
+   without an account system. Wrong token → 403, double claim → 409.
+5. **Retention.** A background sweeper deletes claimed deliveries N days
+   after claiming and unclaimed ones M days after delivery (both
+   configurable, `0` keeps everything), so abandoned mailboxes and
+   wrong-hint deposits do not grow the table forever. Full design
+   rationale: [docs/credential-mailbox.md](docs/credential-mailbox.md).
 
 The gateway is a dead drop: it sees issuer id, mailbox tag, ciphertext,
-signature. There is deliberately no field in the request schema where
-plaintext claim data could go.
+signature, and a token *hash*. There is deliberately no field in the
+request schema where plaintext claim data could go.
 
 ### Auditor disclosure
 
@@ -192,6 +210,19 @@ leaves a gap in leaf indexes (mid-backfill or a missed event), the tree
 a misplaced leaf would make every client proof silently unverifiable,
 which is strictly worse than serving a shorter, correct tree.
 
+**Root history.** A proof is generated against a root that the very next
+deposit supersedes, so the pool contract accepts a window of recent
+historical roots. The backend mirrors that: because the tree is
+append-only, the root after leaf *n* is a pure function of the first *n*
+leaves, and the API persists one `tree_roots` row per appended leaf as it
+tops up. `GET /v1/tree/{pool}/root?at_ledger=L` (or `?at_leaf_count=N`)
+answers "what was the root then?" with an index lookup — provers use it
+to check their anchor is still inside the contract's window, and
+disclosure verification uses it to validate week-old reports while
+deposits keep landing. The history is deterministic and idempotent, so
+the drop-the-database recovery property fully survives: replaying from
+ledger 0 reproduces an identical `tree_roots` table.
+
 The hash is currently a SHA-256 placeholder behind the `TreeHasher` trait;
 production requires the same Poseidon-over-BLS12-381 instance the circuits
 use (see [ISSUES.md](ISSUES.md), Issue 1 — security-critical).
@@ -204,15 +235,25 @@ Axum HTTP server (`:8080` by default). Runs migrations on startup. Serves:
 
 - **Tree endpoints** — per-pool cached incremental tree (see above),
   returning paths, roots, leaf counts, and the `anchored_ledger` (the
-  ledger of the newest indexed leaf, which clients pin proofs to).
+  ledger of the newest indexed leaf, which clients pin proofs to), plus
+  historical roots from the `tree_roots` table via `at_ledger` /
+  `at_leaf_count`.
 - **Note relay** — cursor-paginated ciphertext pages (`id` is the cursor,
-  500 rows/page) and an SSE stream. A background poller watches
-  `encrypted_notes` every 2 s and fans new rows out to SSE subscribers
-  over a broadcast channel; slow subscribers that miss broadcasts re-sync
-  via the paginated endpoint.
-- **Issuer gateway** — credential dead-drop with size caps (64 KiB
-  ciphertext) and active-issuer checks. Issuer signature verification is
-  pending the M5 envelope format (Issue 3).
+  500 rows/page) and a **resumable SSE stream**. Fan-out is push: a
+  Postgres trigger fires `NOTIFY attesta_notes` on every insert and the
+  API `LISTEN`s, falling back to a 2 s table poll whenever the listen
+  connection drops (the stream never goes down with it). Every event
+  carries `id:`, so a client reconnecting with `Last-Event-ID` first
+  gets every missed note replayed in order, then continues live — the
+  broadcast is subscribed *before* the replay query and the overlap is
+  deduped by cursor, so there are no gaps and no duplicates. Consumers
+  that fall too far behind receive a `resync` event telling them to
+  re-page `/v1/notes` rather than silently missing data.
+- **Issuer gateway + mailbox** — credential dead-drop with size caps
+  (64 KiB ciphertext), active-issuer checks, a per-issuer hourly delivery
+  quota, claim-token claims, paginated pickup, and a retention sweeper
+  (all described above). Issuer signature verification is pending the M5
+  envelope format (Issue 3).
 - **Stats** — public-by-construction numbers: per-pool TVL
   (`total_in − total_out`), commitment/nullifier counts, issuer and
   delivery counts.
@@ -220,9 +261,13 @@ Axum HTTP server (`:8080` by default). Runs migrations on startup. Serves:
   `ARTIFACTS_DIR`, each served with an `x-artifact-sha256` header and an
   immutable cache policy; a `manifest.json` per circuit version lists
   files and hashes. Path segments are strictly validated (no traversal).
+- **Health + metrics** — `/health/live`, a database-backed
+  `/health/ready`, and Prometheus exposition at `/metrics` (see
+  [Operations & observability](#operations--observability)).
 
-A 256 KiB global request-body limit is enforced; ciphertext blobs are
-small by design.
+A 256 KiB global request-body limit is enforced (ciphertext blobs are
+small by design), and every endpoint sits behind per-IP rate limits —
+see [Abuse protection](#abuse-protection).
 
 ### `attesta-indexer`
 
@@ -243,6 +288,13 @@ A poll loop per configured contract (`POOL_CONTRACT_IDS`, plus optionally
    keys — ingest is **idempotent**, so replays, cursor resets, and
    crash-restarts are always safe, and the entire database can be rebuilt
    from ledger 0 at any time.
+
+Every pass records metrics: an ingest-lag gauge per contract (chain head
+minus cursor), decoded/undecodable event counters (undecodable growth
+means the deployed contracts' layout drifted — a loud signal, not a
+silent drop), sync error counters, and loop-duration histograms. The
+scrape listener is opt-in via `INDEXER_METRICS_ADDR` (separate port, off
+by default).
 
 ### `attesta-disclosure`
 
@@ -270,18 +322,26 @@ invariant, there is no column for a plaintext amount, key, or credential.
 | `commitments` | tree leaves: `(pool, leaf_index, commitment, ledger, tx_hash)`, unique per pool on both leaf index and commitment | indexer |
 | `nullifiers` | spent-note tags, unique per pool | indexer |
 | `encrypted_notes` | `(commitment, ephemeral_pubkey, ciphertext)` blobs; serial `id` doubles as the pagination cursor | indexer |
+| `tree_roots` | root-after-each-append history: `(pool, leaf_count, root, ledger)`, unique per pool+leaf_count; serves historical root queries | API (during tree top-up) |
 | `issuers` | registry mirror: key, claim types, status (`active`/`suspended`/`revoked`) | indexer |
-| `credential_deliveries` | issuer-gateway dead drops: ciphertext + signature keyed by opaque `recipient_hint` | API |
+| `credential_deliveries` | issuer-gateway dead drops: ciphertext + signature keyed by opaque `recipient_hint`, plus `claim_token_hash` (claim authorization), `seq` (pickup cursor), `claimed_at` | API |
 | `pool_totals` | running public in/out totals per pool (TVL = in − out) | indexer |
 
-Everything the indexer writes is replayable from chain events;
-`credential_deliveries` is the only state that exists nowhere else, and it
-is ciphertext a recipient re-fetches at leisure.
+Everything the indexer writes — and the API-computed `tree_roots`
+history, which is a deterministic function of the leaves — is replayable
+from chain events. **`credential_deliveries` is the single exception**:
+it exists nowhere else, so it is the one table worth backing up (see
+ISSUES-2.md, Issue 19 for the durability plan).
 
 ## API reference
 
 ```
-GET  /health                               → liveness
+GET  /health/live   (alias /health)        → liveness: process is up, never touches the DB
+GET  /health/ready                         → readiness: SELECT 1 against Postgres, plus
+                                             optional indexer-freshness check
+                                             (READY_MAX_INDEXER_STALENESS_SECS);
+                                             503 { failing: "database" | "indexer_staleness" }
+GET  /metrics                              → Prometheus exposition (see Operations)
 GET  /v1/tree/{pool}/path?commitment=0x…   → Merkle path for proving
        { pool, leaf_index, root, leaf_count, anchored_ledger,
          path: [{ sibling, sibling_on_right }] × 32 }
@@ -322,12 +382,53 @@ Errors are JSON with appropriate status codes: 400 for malformed input
 pools/commitments/artifacts, 403/409 for claim failures, and 429 (with
 `Retry-After`) when a rate limit or quota trips.
 
-Abuse protection ships on by default (per-IP token buckets with separate
-read/write budgets, SSE connection caps, a per-issuer hourly delivery
-quota, and an optional CORS allowlist for browser provers). Every limit
-is a `RATE_LIMIT_*` / `CORS_ALLOWED_ORIGINS` env knob and `0` disables
-it — see `.env.example`. Limits key on the socket peer address, so when
-running behind a reverse proxy, enforce limits there as well.
+## Abuse protection
+
+The API is designed to be exposed publicly by self-hosters, so sane
+limits ship **on by default** rather than assuming a reverse proxy:
+
+- **Per-IP token buckets** with *separate* read and write budgets — a
+  throttled writer cannot starve reads, and vice versa. Refill is lazy
+  (no background task); 429 responses carry `Retry-After` and the
+  standard JSON error shape.
+- **SSE connection caps**, per IP and global. Each stream holds one RAII
+  slot released when the connection drops, so a leaking client cannot
+  starve other subscribers.
+- **Per-issuer delivery quota** (rows/hour, sliding window over the
+  table itself) — one compromised or buggy issuer key cannot flood the
+  mailbox.
+- **CORS allowlist** for browser provers: off unless
+  `CORS_ALLOWED_ORIGINS` is set; `*` opens every origin (the read API is
+  public data anyway).
+
+Every limit is a `RATE_LIMIT_*` env knob and `0` disables it, so private
+deployments can switch everything off and behave exactly as before.
+Limits key on the socket peer address; when running behind a reverse
+proxy, enforce limits there as well (the peer the API sees is the proxy).
+
+## Operations & observability
+
+Full guide with scrape config and starter alert rules:
+[docs/operations.md](docs/operations.md). The short version:
+
+- **Probes.** `/health/live` says the process is up (never touches the
+  database — safe for restart decisions). `/health/ready` runs `SELECT 1`
+  and, optionally, checks that an indexer cursor advanced within
+  `READY_MAX_INDEXER_STALENESS_SECS`; it flips to 503 during a database
+  outage and recovers by itself. The Docker image `HEALTHCHECK` and the
+  compose `api` service probe readiness.
+- **API metrics** (`/metrics`): request counts and latency histograms
+  labeled by *route pattern* (never raw URLs, so mailbox hints can't
+  leak into labels), an SSE subscriber gauge, tree lock-wait and top-up
+  histograms, and a per-pool leaf-count gauge.
+- **Indexer metrics** (opt-in listener on `INDEXER_METRICS_ADDR`):
+  per-contract ingest lag, decoded/undecodable event counters, sync
+  error counters, and sync duration histograms. The two loudest alerts
+  to configure first: lag growth (chain outpacing ingest or a wedged
+  loop) and *any* undecodable-event increase (contract event-layout
+  drift).
+- **Invariant:** metrics expose pool ids, contract ids, route patterns,
+  counts, and timings only — never per-user data.
 
 ## Development setup
 
@@ -359,9 +460,17 @@ and exercising the tree endpoints), see `.claude/skills/verify/SKILL.md`.
 
 ### Configuration
 
-All via environment (see `.env.example`): `DATABASE_URL`, `BIND_ADDR`,
-`SOROBAN_RPC_URL`, `POOL_CONTRACT_IDS` (comma-separated),
-`REGISTRY_CONTRACT_ID`, `INDEXER_POLL_SECS`, `ARTIFACTS_DIR`, `RUST_LOG`.
+All via environment (see `.env.example` for every knob with defaults):
+
+| Group | Variables |
+| --- | --- |
+| Core | `DATABASE_URL`, `BIND_ADDR`, `RUST_LOG` |
+| Chain | `SOROBAN_RPC_URL`, `STELLAR_NETWORK_PASSPHRASE`, `POOL_CONTRACT_IDS` (comma-separated), `REGISTRY_CONTRACT_ID`, `INDEXER_POLL_SECS` |
+| Artifacts | `ARTIFACTS_DIR` |
+| Mailbox retention | `CREDENTIAL_RETENTION_CLAIMED_DAYS` (30), `CREDENTIAL_RETENTION_UNCLAIMED_DAYS` (180) — `0` keeps everything |
+| Abuse protection | `RATE_LIMIT_READ_PER_SEC`/`_BURST`, `RATE_LIMIT_WRITE_PER_SEC`/`_BURST`, `RATE_LIMIT_SSE_PER_IP`/`_GLOBAL`, `RATE_LIMIT_ISSUER_DELIVERIES_PER_HOUR`, `CORS_ALLOWED_ORIGINS` — `0`/empty disables |
+| Observability | `READY_MAX_INDEXER_STALENESS_SECS` (0 = skip), `INDEXER_METRICS_ADDR` (unset = no listener) |
+
 No secrets are needed to run any component — by design there are none to
 configure.
 
@@ -435,8 +544,21 @@ cargo run --bin disclosure -- verify report.json
 - [ ] Disclosure trial-decryption + per-entry Merkle path verification
       (blocked on the M3 note encryption format)
 
-The full backlog with per-issue tasks and acceptance criteria lives in
-[ISSUES.md](ISSUES.md).
+## Issue backlogs
+
+Two backlog documents carry per-issue descriptions, task lists, and
+acceptance criteria, written to be pasted into the tracker as-is:
+
+- **[ISSUES.md](ISSUES.md)** — wave 1 (issues 1–10). Issues 5–9 are
+  implemented (status notes inline); 1–4 remain blocked on external
+  deliverables: the circuit repo's Poseidon parameters (1), the frozen
+  contract event layout (2), and the M5/M3 envelope formats (3, 4).
+- **[ISSUES-2.md](ISSUES-2.md)** — wave 2 (issues 11–20): lifecycle
+  hardening (graceful shutdown, indexer poison-event/retention handling),
+  pool-scoped SSE, multi-replica semantics, consistency self-audit,
+  artifacts CDN streaming, stats caching, request tracing,
+  `credential_deliveries` durability, and the CI pipeline (which
+  supersedes wave 1's issue 10).
 
 ## Contributing
 
