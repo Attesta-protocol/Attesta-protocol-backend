@@ -145,23 +145,35 @@ async fn verify(api_url: String, report_path: PathBuf) -> anyhow::Result<()> {
             .with_context(|| format!("reading {}", report_path.display()))?,
     )?;
     let pool = report["pool"].as_str().context("report missing pool")?;
+    let anchored_ledger = report["anchored_ledger"]
+        .as_i64()
+        .context("report missing anchored_ledger")?;
 
-    let live: serde_json::Value = reqwest::Client::new()
+    // Compare against the root *as it stood at the report's anchored
+    // ledger*, not the current live root — deposits keep landing after a
+    // report is generated, so the live root diverges from the report's
+    // root even when every entry in the report is still perfectly valid.
+    // The `tree_roots` history (README: "Root history") exists precisely
+    // to answer this question.
+    let historical: serde_json::Value = reqwest::Client::new()
         .get(format!("{api_url}/v1/tree/{pool}/root"))
+        .query(&[("at_ledger", anchored_ledger)])
         .send()
         .await?
-        .error_for_status()?
+        .error_for_status()
+        .context("fetching historical root (is at_ledger still in tree_roots history?)")?
         .json()
         .await?;
 
     // TODO(M4): re-verify each entry's Merkle path against the anchored
-    // root, not just compare current roots.
-    let matches = live["root"] == report["tree_root"];
+    // root, not just compare roots.
+    let matches = historical["root"] == report["tree_root"];
     println!(
         "{}",
         json!({
             "report_root": report["tree_root"],
-            "live_root": live["root"],
+            "anchored_ledger": anchored_ledger,
+            "historical_root": historical["root"],
             "roots_match": matches,
         })
     );
