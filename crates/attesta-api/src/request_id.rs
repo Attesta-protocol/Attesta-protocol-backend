@@ -30,9 +30,7 @@ pub async fn attach_request_id(req: Request, next: Next) -> Response {
         .headers()
         .get(&HEADER)
         .and_then(|v| v.to_str().ok())
-        .filter(|s| {
-            !s.is_empty() && s.len() <= MAX_LEN && s.chars().all(|c| c.is_ascii_graphic())
-        })
+        .filter(|s| !s.is_empty() && s.len() <= MAX_LEN && s.chars().all(|c| c.is_ascii_graphic()))
         .map(str::to_owned);
     let request_id = incoming.unwrap_or_else(|| Uuid::new_v4().to_string());
 
@@ -64,11 +62,16 @@ async fn embed_id_in_json_body(response: Response, request_id: &str) -> Response
         return Response::from_parts(parts, Body::from(bytes));
     };
     if let Some(obj) = value.as_object_mut() {
-        obj.insert("request_id".into(), serde_json::Value::String(request_id.to_owned()));
+        obj.insert(
+            "request_id".into(),
+            serde_json::Value::String(request_id.to_owned()),
+        );
     }
     let new_body = serde_json::to_vec(&value).unwrap_or_else(|_| bytes.to_vec());
     if let Ok(len) = HeaderValue::from_str(&new_body.len().to_string()) {
-        parts.headers.insert(axum::http::header::CONTENT_LENGTH, len);
+        parts
+            .headers
+            .insert(axum::http::header::CONTENT_LENGTH, len);
     }
     Response::from_parts(parts, Body::from(new_body))
 }
