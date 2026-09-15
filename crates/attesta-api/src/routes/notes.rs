@@ -72,6 +72,11 @@ pub struct StreamQuery {
     /// Equivalent to the Last-Event-ID header, for clients (e.g. curl or
     /// EventSource polyfills) that cannot set it.
     pub since_cursor: Option<i64>,
+    /// Optional pool filter, comma-separated for more than one
+    /// (`?pool=A,B`). Unset streams every pool. Cursor semantics stay
+    /// global (note ids are global), so switching filters across
+    /// reconnects remains gap-free.
+    pub pool: Option<String>,
 }
 
 /// GET /v1/notes/stream — SSE stream of newly indexed encrypted notes.
@@ -103,6 +108,14 @@ pub async fn stream_notes(
         .and_then(|v| v.parse::<i64>().ok())
         .or(q.since_cursor);
 
+    let pools: Option<Vec<String>> = q.pool.as_deref().map(|s| {
+        s.split(',')
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(String::from)
+            .collect()
+    });
+
     // Subscribe before the replay query so nothing inserted in between is
     // lost; the overlap is deduped by cursor below.
     let rx = state.note_tx.subscribe();
@@ -111,10 +124,13 @@ pub async fn stream_notes(
         Some(cursor) => {
             let rows: Vec<EncryptedNoteRow> = sqlx::query_as(
                 "SELECT id, pool, commitment, ephemeral_pubkey, ciphertext, ledger, tx_hash
-                 FROM encrypted_notes WHERE id > $1 ORDER BY id LIMIT $2",
+                 FROM encrypted_notes
+                 WHERE id > $1 AND ($3::text[] IS NULL OR pool = ANY($3))
+                 ORDER BY id LIMIT $2",
             )
             .bind(cursor)
             .bind(REPLAY_LIMIT)
+            .bind(pools.as_deref())
             .fetch_all(&state.db)
             .await
             .map_err(|e| ApiError::from(e).into_response())?;
@@ -141,6 +157,11 @@ pub async fn stream_notes(
                     return None;
                 }
                 last_seen = note.id;
+                if let Some(pools) = &pools {
+                    if !pools.iter().any(|p| p == &note.pool) {
+                        return None;
+                    }
+                }
                 Some(Ok(note_event(&note)?))
             }
             // Slow consumer overflowed the broadcast buffer: tell it to

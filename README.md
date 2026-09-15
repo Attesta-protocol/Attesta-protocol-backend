@@ -352,11 +352,15 @@ GET  /v1/tree/{pool}/root                  → { pool, root, leaf_count, anchore
         lookup, never a rebuild; history replays identically after a
         database drop)
 GET  /v1/notes?since_cursor=&pool=         → { notes: […], next_cursor } (500/page)
-GET  /v1/notes/stream                      → SSE, event: note (id: = cursor),
+GET  /v1/notes/stream?pool=              → SSE, event: note (id: = cursor),
                                              20 s keep-alive; resume with the
                                              Last-Event-ID header or ?since_cursor=
                                              (replays missed notes in order, then
                                              goes live — no gaps, no duplicates).
+                                             ?pool= filters to one or more pools
+                                             (comma-separated); cursor stays
+                                             global, so switching pools across
+                                             reconnects is still gap-free.
                                              A `resync` event means re-page
                                              /v1/notes before trusting the stream.
                                              Fan-out is push (LISTEN/NOTIFY) with
