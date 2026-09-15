@@ -19,9 +19,7 @@ use tracing_subscriber::EnvFilter;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
-        .init();
+    init_tracing();
 
     let config = Config::from_env()?;
 
@@ -58,4 +56,16 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     ingest::run(pool, client, config).await
+}
+
+/// Plain-text logs by default; `LOG_FORMAT=json` switches to one JSON
+/// object per line for log aggregators (ISSUES-2.md Issue 18).
+fn init_tracing() {
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
+    let json = std::env::var("LOG_FORMAT").is_ok_and(|v| v.eq_ignore_ascii_case("json"));
+    if json {
+        tracing_subscriber::fmt().json().with_env_filter(filter).init();
+    } else {
+        tracing_subscriber::fmt().with_env_filter(filter).init();
+    }
 }

@@ -9,6 +9,7 @@
 
 mod error;
 mod limits;
+mod request_id;
 mod retention;
 mod routes;
 mod state;
@@ -31,9 +32,7 @@ use crate::state::AppState;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
-        .init();
+    init_tracing();
 
     let config = Config::from_env()?;
     let pool = db::connect(&config.database_url).await?;
@@ -74,7 +73,10 @@ async fn main() -> anyhow::Result<()> {
     let mut app = routes::router(state)
         .layer(axum::middleware::from_fn(telemetry::track_requests))
         .layer(RequestBodyLimitLayer::new(256 * 1024)) // ciphertext blobs are small
-        .layer(TraceLayer::new_for_http());
+        .layer(TraceLayer::new_for_http())
+        // Outermost: every response, success or error, gets a correlation
+        // id before anything else touches it.
+        .layer(axum::middleware::from_fn(request_id::attach_request_id));
 
     // Browser provers need CORS; off unless origins are configured.
     // `CORS_ALLOWED_ORIGINS=*` opens every origin (read API is public
@@ -122,6 +124,18 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = ctrl_c => tracing::info!("received SIGINT; shutting down gracefully"),
         _ = terminate => tracing::info!("received SIGTERM; shutting down gracefully"),
+    }
+}
+
+/// Plain-text logs by default; `LOG_FORMAT=json` switches to one JSON
+/// object per line for log aggregators (ISSUES-2.md Issue 18).
+fn init_tracing() {
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
+    let json = std::env::var("LOG_FORMAT").is_ok_and(|v| v.eq_ignore_ascii_case("json"));
+    if json {
+        tracing_subscriber::fmt().json().with_env_filter(filter).init();
+    } else {
+        tracing_subscriber::fmt().with_env_filter(filter).init();
     }
 }
 

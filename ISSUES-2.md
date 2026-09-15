@@ -396,6 +396,17 @@ recent-activity signal, which explorers and dashboards want.
 
 ## Issue 18 — Request IDs and structured log output
 
+**Status: implemented.** Every API response carries `x-request-id`
+(echoed from the request if supplied — bounded and ASCII-graphic-checked
+— generated as a UUID otherwise); the id is attached to a tracing span
+wrapping the whole request, so every log line inside carries it; 5xx
+JSON bodies get `request_id` merged in. `LOG_FORMAT=json` (both
+binaries) switches to one JSON object per line. Verified live: a 500
+triggered by a stopped database returns `{"error":"internal
+error","request_id":"trace-500-test"}` and the same id appears on the
+underlying `database error` log line, closing the "hidden detail by id"
+loop; `LOG_FORMAT=json` produces valid JSON lines.
+
 **Labels:** `backend`, `api`, `operations`
 
 ### Description
