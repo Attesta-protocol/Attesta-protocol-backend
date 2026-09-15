@@ -1,0 +1,22 @@
+# Local build artifacts and VCS — never part of the image, and copying
+# them into the build context needlessly bloats it (target/ alone routinely
+# reaches multiple GB of incremental build state, which can exhaust disk
+# space on the build host for no benefit: the builder stage runs its own
+# `cargo build` from source inside the container).
+target/
+.git/
+.github/
+
+# Local-only config and secrets; never bake these into an image.
+.env
+*.env.local
+
+# Editor/OS cruft.
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Documentation and scratch state not needed to build or run the binaries.
+*.md
+.claude/
