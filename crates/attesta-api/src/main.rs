@@ -86,12 +86,43 @@ async fn main() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(&config.bind_addr).await?;
     tracing::info!(addr = %config.bind_addr, "attesta-api listening");
     // ConnectInfo gives the rate limiter each client's peer address.
+    // Graceful shutdown: on SIGTERM/SIGINT, stop accepting new connections
+    // and let in-flight requests (including open SSE streams) finish
+    // instead of `docker stop`/a deploy resetting them mid-response
+    // (ISSUES-2.md Issue 11).
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
+    .with_graceful_shutdown(shutdown_signal())
     .await?;
+    tracing::info!("attesta-api shut down");
     Ok(())
+}
+
+/// Resolves on SIGTERM (the signal `docker stop`/orchestrators send) or
+/// SIGINT (Ctrl-C), whichever comes first.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install SIGINT handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => tracing::info!("received SIGINT; shutting down gracefully"),
+        _ = terminate => tracing::info!("received SIGTERM; shutting down gracefully"),
+    }
 }
 
 fn cors_layer(origins: &[String]) -> anyhow::Result<Option<CorsLayer>> {
