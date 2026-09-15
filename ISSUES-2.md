@@ -452,6 +452,20 @@ only, which log aggregators tolerate but parse badly.
 
 ## Issue 19 — Durability story for `credential_deliveries`
 
+**Status: implemented** (documentation + verified recipe; the optional
+unclaimed-deliveries gauge is not done). `docs/operations.md` now has a
+"Backups and durability" section with a `pg_dump`/restore recipe and the
+retention-sweeper interaction. The restore-safety question the issue
+raised — could a restored `seq` collide with a newly auto-generated one
+— was tested directly: seeded rows, `pg_dump --table=credential_deliveries
+--data-only`, truncated, restored, then inserted new rows and claimed a
+restored delivery through the live `/v1/credentials/{id}/claim`
+endpoint. No collision: `pg_dump`'s output already includes the
+`setval()` call for the `seq` identity sequence right after the `COPY`,
+so a plain dump/restore round trip is safe by construction. Pickup
+pagination and claim-token verification both worked identically against
+the restored data.
+
 **Labels:** `backend`, `operations`, `documentation`
 
 ### Description
