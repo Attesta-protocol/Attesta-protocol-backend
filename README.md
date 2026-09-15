@@ -252,8 +252,11 @@ Axum HTTP server (`:8080` by default). Runs migrations on startup. Serves:
 - **Issuer gateway + mailbox** — credential dead-drop with size caps
   (64 KiB ciphertext), active-issuer checks, a per-issuer hourly delivery
   quota, claim-token claims, paginated pickup, and a retention sweeper
-  (all described above). Issuer signature verification is pending the M5
-  envelope format (Issue 3).
+  (all described above). The sweeper takes a Postgres advisory lock for
+  its whole cycle, so with multiple API replicas pointed at one database
+  exactly one replica sweeps per hour instead of all of them racing the
+  same deletes (ISSUES-2.md Issue 14). Issuer signature verification is
+  pending the M5 envelope format (Issue 3).
 - **Stats** — public-by-construction numbers: per-pool TVL
   (`total_in − total_out`), commitment/nullifier counts, issuer and
   delivery counts.

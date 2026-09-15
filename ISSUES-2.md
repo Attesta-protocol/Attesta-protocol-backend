@@ -168,6 +168,15 @@ one loop, and its failure handling has three sharp edges:
 
 ## Issue 14 — Multi-replica deployment semantics
 
+**Status: partially implemented.** Retention sweeper now takes a
+`pg_try_advisory_lock` for its whole cycle (acquire → sweep → release on
+one held connection), so exactly one replica sweeps per hour; verified
+against a live database that a second replica observes the lock held and
+skips with a debug log, and that the lock is released cleanly afterward.
+Rate limits, SSE caps, and tree-cache convergence semantics below are
+still just documented, not changed (they were already safe, per-replica
+by design).
+
 **Labels:** `backend`, `api`, `operations`
 
 ### Description
