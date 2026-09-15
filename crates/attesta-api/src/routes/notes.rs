@@ -92,6 +92,11 @@ pub struct StreamQuery {
 /// Retry-After when exhausted); each connection holds one RAII slot that
 /// is released when the stream drops, so one client cannot starve other
 /// subscribers.
+// This handler runs once per new SSE connection (not a hot loop), and its
+// Err variant is a plain `Response` (~128 bytes) rather than the boxed
+// form clippy suggests: boxing would touch every call site below for no
+// measurable benefit on a path this infrequent.
+#[allow(clippy::result_large_err)]
 pub async fn stream_notes(
     State(state): State<Arc<AppState>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
