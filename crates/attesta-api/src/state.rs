@@ -1,9 +1,13 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex as StdMutex},
+    time::Instant,
+};
 
 use attesta_core::{
     config::Config,
     merkle::{MerkleTree, Node, Sha256Hasher},
-    models::EncryptedNoteRow,
+    models::{EncryptedNoteRow, ProtocolStats},
 };
 use sqlx::PgPool;
 use tokio::sync::{broadcast, Mutex};
@@ -30,6 +34,11 @@ pub struct AppState {
     /// map is fine at current scale; requests only hold it for the top-up
     /// query plus O(new leaves · depth) hashing.
     pub trees: Mutex<HashMap<String, PoolTree>>,
+    /// Last assembled GET /v1/stats result plus when it was computed, so
+    /// repeat requests within `stats_cache_ttl_secs` don't each pay for
+    /// four full-table scans (ISSUES-2.md Issue 17). A plain std Mutex is
+    /// fine: the critical section never awaits.
+    pub stats_cache: StdMutex<Option<(Instant, ProtocolStats)>>,
 }
 
 /// In-memory mirror of one pool's commitment tree.

@@ -27,6 +27,10 @@ pub struct Config {
     /// this many seconds. 0 disables the staleness check (API-only
     /// deployments, or before any contracts are configured).
     pub ready_max_indexer_staleness_secs: u32,
+    /// GET /v1/stats caches its assembled result for this many seconds so
+    /// repeat traffic doesn't each pay for four full-table scans. 0
+    /// disables caching (always recompute).
+    pub stats_cache_ttl_secs: u32,
 }
 
 /// Per-IP token buckets and quotas. A value of 0 disables that limit.
@@ -95,6 +99,7 @@ impl Config {
                 .map(String::from)
                 .collect(),
             ready_max_indexer_staleness_secs: env_u32("READY_MAX_INDEXER_STALENESS_SECS", 0),
+            stats_cache_ttl_secs: env_u32("STATS_CACHE_TTL_SECS", 10),
         })
     }
 }

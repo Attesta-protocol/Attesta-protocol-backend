@@ -65,6 +65,7 @@ async fn main() -> anyhow::Result<()> {
         write_buckets: limits::IpBuckets::new(rl.write_per_sec, rl.write_burst),
         sse_slots: Arc::new(limits::SseSlots::new(rl.sse_per_ip, rl.sse_global)),
         trees: Default::default(),
+        stats_cache: Default::default(),
     });
 
     tokio::spawn(routes::notes::poll_new_notes(state.clone()));

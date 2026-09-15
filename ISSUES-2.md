@@ -328,6 +328,14 @@ support, all of which matter for large files on flaky connections.
 
 ## Issue 17 — Stats: bounded-cost queries, short-TTL cache, and per-pool detail
 
+**Status: partially implemented.** `GET /v1/stats` now caches its
+assembled result in `AppState` for `STATS_CACHE_TTL_SECS` (default 10s, 0
+disables) and sets `Cache-Control: public, max-age=<ttl>`, so the four
+full-table scans run at most once per TTL window regardless of request
+volume; verified live that a request inside the window returns the
+stale-but-consistent cached value and a request after expiry recomputes.
+Per-pool grouped counts and `GET /v1/pools/{pool}/stats` are not done.
+
 **Labels:** `backend`, `api`, `performance`
 
 ### Description
