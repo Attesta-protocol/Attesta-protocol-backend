@@ -517,6 +517,21 @@ be stated).
 
 ## Issue 20 — CI pipeline with the end-to-end integration harness
 
+**Status: partially implemented.** `.github/workflows/ci.yml` runs on
+every PR and push to main: `cargo fmt --all --check`,
+`cargo clippy --all-targets --all-features -- -D warnings`,
+`cargo test --all --all-features`, and a Docker build (no push), each
+as an independent job with `Swatinem/rust-cache`. Turning on
+`-D warnings` immediately surfaced a real pre-existing
+`clippy::result_large_err` finding on `stream_notes`, fixed in the
+commit just before this one — concrete evidence the pipeline catches
+things manual runs were missing. Not done: promoting the mock Soroban
+RPC into a checked-in fixture and the full integration job (indexer →
+Postgres → API assertions, claim lifecycle, SSE resume, rate limiting,
+readiness) that exercises the whole verify-skill recipe automatically —
+that's a substantially larger effort and still needs a Postgres service
+container plus the hand-encoded XDR fixtures the verify skill uses.
+
 **Labels:** `backend`, `ci`, `testing`
 **Supersedes:** ISSUES.md Issue 10 (unimplemented; scope extended to the
 wave-1 features that have since landed)

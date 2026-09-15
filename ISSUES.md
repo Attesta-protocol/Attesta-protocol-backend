@@ -488,6 +488,11 @@ someone reads logs.
 
 ## Issue 10 — CI pipeline with the end-to-end integration harness
 
+**Status: partially implemented; superseded by ISSUES-2.md Issue 20**,
+which has the current status note (core fmt/clippy/test/Docker-build
+checks are live in `.github/workflows/ci.yml`; the integration harness
+promoting the mock Soroban RPC into a checked-in fixture is not done).
+
 **Labels:** `backend`, `ci`, `testing`
 
 ### Description
