@@ -32,7 +32,43 @@ pub async fn run(db: PgPool, client: SorobanClient, config: Config) -> anyhow::R
                 "contract" => contract_id.clone())
             .record(started.elapsed().as_secs_f64());
         }
-        tokio::time::sleep(poll).await;
+
+        // Exit cleanly between passes on SIGTERM/SIGINT instead of dying
+        // mid-poll wherever the signal happens to land: `sync_contract`
+        // always persists its cursor before returning, so a pass boundary
+        // is a safe, well-defined stopping point (ISSUES-2.md Issue 11).
+        tokio::select! {
+            _ = tokio::time::sleep(poll) => {}
+            _ = shutdown_signal() => {
+                tracing::info!("shutdown signal received; indexer exiting after last completed pass");
+                return Ok(());
+            }
+        }
+    }
+}
+
+/// Resolves on SIGTERM (the signal `docker stop`/orchestrators send) or
+/// SIGINT (Ctrl-C), whichever comes first.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install SIGINT handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
     }
 }
 

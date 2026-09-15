@@ -12,6 +12,20 @@ Ordering is by suggested priority, not strictly by number.
 
 ## Issue 11 — Graceful shutdown and startup resilience
 
+**Status: implemented** (the four core tasks below; the background-task
+shutdown-token task is not done — retention sweeper/note poller/metrics
+upkeep still stop via process exit, which is safe since none holds
+long-lived transactions). API: `axum::serve(..).with_graceful_shutdown`
+on SIGTERM/SIGINT, verified live to refuse new connections immediately
+while draining an open SSE stream, then exit once it closes. Indexer:
+same signal handling, exits cleanly between contract-sync passes (a safe
+boundary — `sync_contract` always persists its cursor before returning),
+verified live to log and exit within the same poll tick. `db::connect`:
+bounded exponential-backoff retry (10 attempts, ~5s timeout each, 500ms
+→ 10s backoff), verified live to recover with no process restart when
+Postgres starts late, and to fail within the same second on a wrong
+password rather than retrying it.
+
 **Labels:** `backend`, `api`, `indexer`, `operations`
 
 ### Description
