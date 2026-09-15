@@ -248,7 +248,10 @@ Axum HTTP server (`:8080` by default). Runs migrations on startup. Serves:
   broadcast is subscribed *before* the replay query and the overlap is
   deduped by cursor, so there are no gaps and no duplicates. Consumers
   that fall too far behind receive a `resync` event telling them to
-  re-page `/v1/notes` rather than silently missing data.
+  re-page `/v1/notes` rather than silently missing data. `?pool=`
+  (comma-separated for more than one) filters the stream to specific
+  pools, in both the replay and live phases, without breaking cursor
+  semantics (ISSUES-2.md Issue 12).
 - **Issuer gateway + mailbox** — credential dead-drop with size caps
   (64 KiB ciphertext), active-issuer checks, a per-issuer hourly delivery
   quota, claim-token claims, paginated pickup, and a retention sweeper
@@ -259,7 +262,10 @@ Axum HTTP server (`:8080` by default). Runs migrations on startup. Serves:
   pending the M5 envelope format (Issue 3).
 - **Stats** — public-by-construction numbers: per-pool TVL
   (`total_in − total_out`), commitment/nullifier counts, issuer and
-  delivery counts.
+  delivery counts. Cached for `STATS_CACHE_TTL_SECS` (default 10s, 0
+  disables) with a matching `Cache-Control` header, so the underlying
+  full-table scans run at most once per window regardless of traffic
+  (ISSUES-2.md Issue 17).
 - **Artifacts CDN** — versioned proving keys and WASM provers from
   `ARTIFACTS_DIR`, each served with an `x-artifact-sha256` header and an
   immutable cache policy; a `manifest.json` per circuit version lists
@@ -303,10 +309,14 @@ by default).
 
 A local CLI, not a service. `generate` reads a viewing key file, fetches
 the pool root and every encrypted note from a configurable backend
-(`ATTESTA_API_URL`), and writes a JSON report; `verify` re-checks a report
-against a backend. Trial decryption and per-entry Merkle verification are
-pending the M3 note format (Issue 4) — today the report carries the scan
-scope and root anchor with an empty entries list.
+(`ATTESTA_API_URL`), and writes a JSON report; `verify` re-checks a
+report against a backend by fetching the root *as it stood at the
+report's `anchored_ledger`* (via `/root?at_ledger=`), not the live
+current root — so an old report against a pool that has kept taking
+deposits still verifies correctly instead of spuriously failing.
+Trial decryption and per-entry Merkle path verification are still
+pending the M3 note format (Issue 4) — today the report carries the
+scan scope and root anchor with an empty entries list.
 
 ### `attesta-core`
 
@@ -333,8 +343,9 @@ invariant, there is no column for a plaintext amount, key, or credential.
 Everything the indexer writes — and the API-computed `tree_roots`
 history, which is a deterministic function of the leaves — is replayable
 from chain events. **`credential_deliveries` is the single exception**:
-it exists nowhere else, so it is the one table worth backing up (see
-ISSUES-2.md, Issue 19 for the durability plan).
+it exists nowhere else, so it is the one table worth backing up — see
+the verified `pg_dump`/restore recipe in
+[docs/operations.md](docs/operations.md) (ISSUES-2.md Issue 19).
 
 ## API reference
 
@@ -380,6 +391,8 @@ POST /v1/credentials/{delivery_id}/claim   → { claim_token (b64) } → 204
                                               see docs/credential-mailbox.md)
 GET  /v1/issuers                           → non-revoked issuer registry mirror
 GET  /v1/stats                             → { pools: [{pool, asset, tvl}], counts… }
+                                             cached STATS_CACHE_TTL_SECS (default 10s;
+                                             0 disables), Cache-Control: max-age=<ttl>
 GET  /v1/artifacts/{circuit}/{version}     → manifest.json (file list + sha256)
 GET  /v1/artifacts/{circuit}/{version}/{f} → artifact bytes + x-artifact-sha256 header
 ```
@@ -436,6 +449,25 @@ Full guide with scrape config and starter alert rules:
   drift).
 - **Invariant:** metrics expose pool ids, contract ids, route patterns,
   counts, and timings only — never per-user data.
+- **Graceful shutdown.** Both binaries stop accepting new connections on
+  SIGTERM/SIGINT and let in-flight work finish — the API drains open
+  requests and SSE streams before exiting; the indexer finishes its
+  current contract-sync pass (cursor already persisted per completed
+  page) before exiting 0 (ISSUES-2.md Issue 11).
+- **Startup resilience.** `db::connect` retries the initial database
+  connection with exponential backoff (10 attempts, ~5s each, 500ms→10s
+  backoff) instead of exiting on a Postgres that's merely slow to start,
+  while still failing fast on bad credentials (ISSUES-2.md Issue 11).
+- **Request correlation.** Every API response carries `x-request-id`
+  (echoed if the client sent one, generated otherwise); the id is
+  attached to every log line for that request and merged into any 5xx
+  JSON body, so a reported failure traces to its log line in one step.
+  `LOG_FORMAT=json` (both binaries) switches to one JSON object per line
+  for log aggregators (ISSUES-2.md Issue 18).
+- **Backups.** `credential_deliveries` is the one table that isn't
+  replayable from chain events — see [Data model](#data-model) and the
+  verified `pg_dump`/restore recipe in
+  [docs/operations.md](docs/operations.md) (ISSUES-2.md Issue 19).
 
 ## Development setup
 
@@ -454,13 +486,18 @@ Or the full self-hosted stack in containers:
 docker compose --profile full up --build
 ```
 
-Run tests and lints:
+Run tests and lints (the same three checks `.github/workflows/ci.yml`
+runs on every PR and push to `main`, alongside a Docker build):
 
 ```bash
 cargo test
-cargo clippy --all-targets -- -D warnings
-cargo fmt --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo fmt --all --check
 ```
+
+`docker build .` ships only the source the builder stage needs — see
+`.dockerignore` — so a working tree with build artifacts in `target/`
+doesn't bloat (or, worst case, exhaust disk on) the build context.
 
 For end-to-end verification (driving the indexer against a mock Soroban RPC
 and exercising the tree endpoints), see `.claude/skills/verify/SKILL.md`.
@@ -471,12 +508,12 @@ All via environment (see `.env.example` for every knob with defaults):
 
 | Group | Variables |
 | --- | --- |
-| Core | `DATABASE_URL`, `BIND_ADDR`, `RUST_LOG` |
+| Core | `DATABASE_URL`, `BIND_ADDR`, `RUST_LOG`, `LOG_FORMAT` (`text`/`json`) |
 | Chain | `SOROBAN_RPC_URL`, `STELLAR_NETWORK_PASSPHRASE`, `POOL_CONTRACT_IDS` (comma-separated), `REGISTRY_CONTRACT_ID`, `INDEXER_POLL_SECS` |
 | Artifacts | `ARTIFACTS_DIR` |
 | Mailbox retention | `CREDENTIAL_RETENTION_CLAIMED_DAYS` (30), `CREDENTIAL_RETENTION_UNCLAIMED_DAYS` (180) — `0` keeps everything |
 | Abuse protection | `RATE_LIMIT_READ_PER_SEC`/`_BURST`, `RATE_LIMIT_WRITE_PER_SEC`/`_BURST`, `RATE_LIMIT_SSE_PER_IP`/`_GLOBAL`, `RATE_LIMIT_ISSUER_DELIVERIES_PER_HOUR`, `CORS_ALLOWED_ORIGINS` — `0`/empty disables |
-| Observability | `READY_MAX_INDEXER_STALENESS_SECS` (0 = skip), `INDEXER_METRICS_ADDR` (unset = no listener) |
+| Observability | `READY_MAX_INDEXER_STALENESS_SECS` (0 = skip), `INDEXER_METRICS_ADDR` (unset = no listener), `STATS_CACHE_TTL_SECS` (10; 0 disables caching) |
 
 No secrets are needed to run any component — by design there are none to
 configure.
@@ -549,7 +586,10 @@ cargo run --bin disclosure -- verify report.json
 - [ ] Issuer signature verification on credential delivery (blocked on the
       M5 credential envelope format)
 - [ ] Disclosure trial-decryption + per-entry Merkle path verification
-      (blocked on the M3 note encryption format)
+      (blocked on the M3 note encryption format). `verify`'s
+      root-comparison half is fixed — it now checks the historical root
+      at the report's `anchored_ledger` instead of the live root — but
+      entries stay empty until M3 lands.
 
 ## Issue backlogs
 
@@ -561,11 +601,19 @@ acceptance criteria, written to be pasted into the tracker as-is:
   deliverables: the circuit repo's Poseidon parameters (1), the frozen
   contract event layout (2), and the M5/M3 envelope formats (3, 4).
 - **[ISSUES-2.md](ISSUES-2.md)** — wave 2 (issues 11–20): lifecycle
-  hardening (graceful shutdown, indexer poison-event/retention handling),
-  pool-scoped SSE, multi-replica semantics, consistency self-audit,
-  artifacts CDN streaming, stats caching, request tracing,
+  hardening, pool-scoped SSE, multi-replica semantics, consistency
+  self-audit, artifacts CDN streaming, stats caching, request tracing,
   `credential_deliveries` durability, and the CI pipeline (which
-  supersedes wave 1's issue 10).
+  supersedes wave 1's issue 10). **Implemented or partially implemented**
+  (status notes inline): graceful shutdown + startup retry (11), the
+  retention-sweeper half of multi-replica semantics (14), pool-scoped SSE
+  (12), stats caching (17), request-id correlation + `LOG_FORMAT=json`
+  (18), backup/restore documentation (19), and a core
+  fmt/clippy/test/Docker-build CI pipeline (20). **Not done**: the
+  artifacts CDN streaming/ETag hardening (16), indexer per-contract
+  isolation and poison-event handling (13), the consistency self-audit
+  module (15), and the full integration-harness job in CI (20's
+  remaining scope).
 
 ## Contributing
 
